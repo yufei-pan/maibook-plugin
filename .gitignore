@@ -1,0 +1,11 @@
+# 运行时数据（每个聊天流的书稿）
+/data/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# 测试与缓存
+.pytest_cache/
+.ruff_cache/
+*.log
