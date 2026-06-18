@@ -340,7 +340,9 @@ async def main() -> None:
     rec_w1 = await finish(p, started_w1)
     check(rec_w1["status"] == "done", "overwrite 写第 1 章应完成", rec_w1)
     check(len(list((book_dir / ".history").glob("01-chapter.*.md"))) > hist_before, "overwrite 应先快照旧稿到 .history")
-    check(ch2_head_marker in llm.writer_prompts[-1], "写已有后续章时也应注入第 2 章开头", llm.writer_prompts[-1][-800:])
+    prompt_overwrite = llm.writer_prompts[-1]
+    check("【下一章开头" not in prompt_overwrite, "overwrite 丢弃重写时不应注入下一章开头", prompt_overwrite[-800:])
+    check(ch2_head_marker not in prompt_overwrite, "overwrite 时不应带入后续章正文片段", prompt_overwrite[-800:])
 
     # 9c) 回归：写作上下文超字符预算时必须告警，不得静默丢弃 bible 设定/参考资料。
     captured_warnings: list[str] = []

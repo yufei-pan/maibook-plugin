@@ -697,6 +697,7 @@ class MaiBookPlugin(MaiBotPlugin):
 
     def _assemble_context(
         self, book_dir: Path, meta: Mapping[str, Any], task_text: str, *, target_chapter: int,
+        include_next_head: bool = True,
     ) -> str:
         """在字符预算内组装写作上下文（要点→大纲→人物→设定→全部自定义设定→决定→摘要→前文衔接）。
 
@@ -704,7 +705,8 @@ class MaiBookPlugin(MaiBotPlugin):
         自行写入的任意自定义主题）都会作为参考资料带给写手，而不只是几个固定文件。
 
         target_chapter：本次写作/修订的章号。「上一章结尾」仅当第 target_chapter-1 章
-        已存在且非空时才注入；「下一章开头」仅当第 target_chapter+1 章已存在且非空时注入。
+        已存在且非空时才注入；「下一章开头」仅当第 target_chapter+1 章已存在且非空、且
+        include_next_head 为 True 时注入（overwrite 丢弃重写时不带，后续章也可能重写）。
         二者均严格按 N±1 取邻章，缺中间章则不带。
         """
         budget = max(2000, int(self.config.context.char_budget))
@@ -734,9 +736,10 @@ class MaiBookPlugin(MaiBotPlugin):
         prev_tail = self._previous_chapter_tail(book_dir, target_chapter)
         if prev_tail:
             sections.append(("【上一章结尾（用于衔接）】", prev_tail))
-        next_head = self._next_chapter_head(book_dir, target_chapter)
-        if next_head:
-            sections.append(("【下一章开头（用于衔接）】", next_head))
+        if include_next_head:
+            next_head = self._next_chapter_head(book_dir, target_chapter)
+            if next_head:
+                sections.append(("【下一章开头（用于衔接）】", next_head))
 
         remaining = budget - len(task_text) - 64
         included: list[str] = []
@@ -974,7 +977,10 @@ class MaiBookPlugin(MaiBotPlugin):
                 "在此基础上完成、润色、扩写为最终正文，不要另起炉灶或与之冲突。\n\n" + draft.strip()
             )
         task_lines.append("请直接开始写本章正文（可用「## 小节标题」分节）。")
-        user = self._assemble_context(book_dir, meta, "\n".join(task_lines), target_chapter=number)
+        user = self._assemble_context(
+            book_dir, meta, "\n".join(task_lines), target_chapter=number,
+            include_next_head=not (overwrite and existing_body),
+        )
 
         generated = await self._writer_generate(system, user)
         if not generated.get("success"):
@@ -1703,7 +1709,7 @@ class MaiBookPlugin(MaiBotPlugin):
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
             ToolParameterInfo(name="chapter", param_type=ToolParamType.STRING, required=False, default="next", description="章节号；留空或 next 表示续写下一章。建议按顺序逐章写，不要跳号。"),
-            ToolParameterInfo(name="overwrite", param_type=ToolParamType.BOOLEAN, required=False, default=False, description="目标章已有正文时：true=先快照旧稿到 .history 再完全丢弃重写（不把旧文带给写手）；false=拒绝覆盖"),
+            ToolParameterInfo(name="overwrite", param_type=ToolParamType.BOOLEAN, required=False, default=False, description="目标章已有正文时：true=先快照旧稿到 .history 再完全丢弃重写（不把旧文/下一章开头带给写手）；false=拒绝覆盖"),
             ToolParameterInfo(name="brief", param_type=ToolParamType.STRING, required=False, default="", description="本章的特别要求/要点（可选）"),
             ToolParameterInfo(name="content", param_type=ToolParamType.STRING, required=False, default="", description="麦麦为本章提供的参考稿/草稿正文（可选）；写手会以它为基准来完成本章，保留其情节与关键设定"),
             ToolParameterInfo(name="target_words", param_type=ToolParamType.INTEGER, required=False, default=0, description="目标字数（可选，0 表示不限）"),
