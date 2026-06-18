@@ -3,12 +3,12 @@
 设计要点见同目录 README.md。核心思路：
 - 每个聊天流是一个「笔记本」工作区（外加一个 ``__global__`` 全局工作区），其中可建立多本书。
 - 每本书是一个目录：``book.toml`` 元信息、``instructions.md`` 创作说明、``manuscript/`` 正文、
-  ``bible/`` 隐藏设定、``summaries/`` 滚动摘要、``journal/`` 问答与决定、``.history/`` 修订快照、
+  ``bible/`` 隐藏设定、``summaries/`` 滚动摘要、``journal/`` 问答与决定及致谢（``credits.md``）、``.history/`` 修订快照、
   ``compiled/`` 编译产物。
 - 正文由「专职写手模型」（一次性 ``llm.generate`` 调用）生成，系统提示词里注入麦麦的人格与表达
   风格；麦麦本人担任主编，通过工具下达指令、审稿、拍板。
 - 信息不足时「不动笔」：开写前有就绪门禁；写作中允许写手输出 ``===NEED_INFO===`` 区块，由程序把
-  问题抛回给麦麦（绝不直接发给用户），由麦麦自行决定或再问用户。
+  问题抛回给麦麦（绝不直接发给编辑），由麦麦自行决定或再问聊天流中的编辑（editor）。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import hashlib
 import html as html_lib
 import os
 import re
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -63,9 +64,7 @@ REQUIRED_BIBLE: dict[str, str] = {
     "world": "故事背景 / 设定",
 }
 
-# 单次工具返回内容的展示上限，避免塞爆 Planner 上下文
-MAX_RETURN_CHARS = 8000
-
+# 创作说明：不自动落盘，仅作为给麦麦的参考模板；须由她经 setup_instructions 写入 instructions.md
 INSTRUCTIONS_TEMPLATE = """# 《{title}》创作说明
 
 > 这是写手模型每次写作都会读到的「本书专属指令」。请用你自己的话把它写清楚，
@@ -79,6 +78,33 @@ INSTRUCTIONS_TEMPLATE = """# 《{title}》创作说明
 
 ## 必须坚持的设定
 （与 bible/ 中的世界观、人物、时间线保持一致；列出绝对不能写错的关键事实）
+
+## 推进节奏（建议）
+按章号顺序一次只写/改一章（0→1→2…），这样前文衔接最稳。可以跳章或同时发起多个写章任务，但缺了中间章节时「上一章结尾」不会自动补上。
+
+## 编辑（Editor）
+本聊天流中参与讨论、给出建议的编辑，其贡献会记入 ``journal/credits.md`` 的致谢区。
+"""
+
+
+def _instructions_template(title: str) -> str:
+    """返回给麦麦参考的创作说明模板（不写入文件）。"""
+    return INSTRUCTIONS_TEMPLATE.format(title=title)
+
+# 单次工具返回内容的展示上限，避免塞爆 Planner 上下文
+MAX_RETURN_CHARS = 8000
+
+CREDITS_TEMPLATE = """# 《{title}》致谢
+
+作者：{author}
+
+## 编辑（Editor）
+
+参与本书创作讨论的编辑将记录于此。
+
+## 创作模型（Models）
+
+正文写作、章节修订与摘要等辅助生成所用模型将记录于此。
 """
 
 
@@ -91,8 +117,8 @@ def _now() -> str:
 
 
 def _ts() -> str:
-    """返回用于历史快照文件名的紧凑时间戳。"""
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    """返回用于历史快照文件名的紧凑时间戳（纳秒后缀，避免同秒内多次快照互相覆盖）。"""
+    return datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}"
 
 
 def _safe_component(value: str) -> str:
@@ -206,6 +232,38 @@ def _target_chapter_count(meta: Mapping[str, Any]) -> int | None:
     """从 length_target 中解析「N 章」的目标章节数；解析不到返回 None。"""
     match = re.search(r"(\d+)\s*章", str(meta.get("length_target", "")))
     return int(match.group(1)) if match else None
+
+
+def _llm_model_name(result: Mapping[str, Any] | None, fallback: str = "") -> str:
+    """从 llm.generate 返回结构中提取实际模型名。"""
+    if not result:
+        return fallback
+    for key in ("model", "model_name"):
+        value = str(result.get(key) or "").strip()
+        if value:
+            return value
+    return fallback
+
+
+def _resolve_editor(kwargs: Mapping[str, Any], explicit: str = "") -> dict[str, str] | None:
+    """从工具 kwargs 或显式参数解析聊天流中的编辑（editor）身份。"""
+    name = str(explicit or "").strip()
+    for key in ("editor", "editor_name", "user_nickname", "nickname"):
+        if not name:
+            name = str(kwargs.get(key) or "").strip()
+    user_id = str(kwargs.get("user_id") or "").strip()
+    platform = str(kwargs.get("platform") or "").strip()
+    uinfo = kwargs.get("user_info")
+    if isinstance(uinfo, dict):
+        user_id = user_id or str(uinfo.get("user_id") or "").strip()
+        if not name:
+            name = str(uinfo.get("user_nickname") or uinfo.get("nickname") or "").strip()
+    if not name and not user_id:
+        return None
+    display = name or user_id
+    if name and user_id and user_id not in name:
+        display = f"{name} ({user_id})"
+    return {"name": name or user_id, "user_id": user_id, "platform": platform, "display": display}
 
 
 # --------------------------------------------------------------------------- #
@@ -397,7 +455,7 @@ class MaiBookPlugin(MaiBotPlugin):
             await self._surface_to_mai(
                 stream_id,
                 f"你正在写的《{title}》卡在一个需要拍板的地方：\n- " + "\n- ".join(result.get("questions", []))
-                + "\n（这是你自己的书，可凭设定与记忆自行决定；拿不准再问用户。定了用 setup_answer 记入设定。）",
+                + "\n（这是你自己的书，可凭设定与记忆自行决定；拿不准再问编辑（editor）。定了用 setup_answer 记入设定。）",
                 intent=f"为《{title}》定夺若干设定问题并继续推进",
                 reason="maibook_need_info",
                 book_title=title,
@@ -414,7 +472,7 @@ class MaiBookPlugin(MaiBotPlugin):
     async def _surface_to_mai(
         self, stream_id: str, content: str, *, intent: str, reason: str, book_title: str
     ) -> None:
-        """把进展/问题注入麦麦的上下文并唤醒她处理（绝不直接发给用户）。"""
+        """把进展/问题注入麦麦的上下文并唤醒她处理（写作完成时的正文发送在 _surface_task_completion 中单独处理）。"""
         if not stream_id:
             return
         try:
@@ -488,6 +546,88 @@ class MaiBookPlugin(MaiBotPlugin):
                 numbers.append(int(match.group(1)))
         return sorted(numbers)
 
+    def _credits_path(self, book_dir: Path) -> Path:
+        return book_dir / "journal" / "credits.md"
+
+    def _append_editor_credit(
+        self, book_dir: Path, editor: Mapping[str, str], *, topic: str = "", note: str = "编辑建议"
+    ) -> None:
+        """把参与本书讨论的编辑记入 journal/credits.md（去重：同一编辑+主题不重复追加）。"""
+        display = str(editor.get("display") or editor.get("name") or "").strip()
+        if not display:
+            return
+        path = self._credits_path(book_dir)
+        existing = _read_text(path)
+        if not existing.strip():
+            title = str(self._read_meta(book_dir).get("title") or book_dir.name)
+            author = str(self._read_meta(book_dir).get("author") or "麦麦")
+            existing = CREDITS_TEMPLATE.format(title=title, author=author)
+        topic_text = str(topic or "").strip()
+        marker = f"**{display}**"
+        if topic_text and marker in existing and topic_text in existing:
+            return
+        line = f"- **{display}** · {_now()}"
+        if topic_text:
+            line += f" · {topic_text}"
+        if note:
+            line += f"（{note}）"
+        section_key = "## 编辑（Editor）"
+        if section_key not in existing:
+            existing = existing.rstrip() + f"\n\n{section_key}\n\n"
+        parts = existing.split(section_key, 1)
+        head = parts[0] + section_key
+        tail = parts[1] if len(parts) > 1 else "\n\n"
+        models_key = "## 创作模型（Models）"
+        if models_key in tail:
+            editor_body, models_rest = tail.split(models_key, 1)
+            tail = editor_body.rstrip() + f"\n{line}\n\n" + models_key + models_rest
+        else:
+            tail = tail.rstrip() + f"\n{line}\n"
+        _atomic_write(path, (head + tail).rstrip() + "\n")
+
+    def _append_model_credit(
+        self, book_dir: Path, model: str, role: str, *, chapter_no: int | None = None
+    ) -> None:
+        """把实际参与生成的模型记入 journal/credits.md。"""
+        model = str(model or "").strip()
+        if not model:
+            return
+        path = self._credits_path(book_dir)
+        existing = _read_text(path)
+        if not existing.strip():
+            title = str(self._read_meta(book_dir).get("title") or book_dir.name)
+            author = str(self._read_meta(book_dir).get("author") or "麦麦")
+            existing = CREDITS_TEMPLATE.format(title=title, author=author)
+        line = f"- **{model}** · {role}"
+        if chapter_no is not None:
+            line += f" · 第 {chapter_no} 章"
+        line += f" · {_now()}"
+        section_key = "## 创作模型（Models）"
+        if section_key not in existing:
+            existing = existing.rstrip() + f"\n\n{section_key}\n\n"
+        existing = existing.rstrip() + f"\n{line}\n"
+        _atomic_write(path, existing)
+
+    def _record_generation_credits(
+        self,
+        book_dir: Path,
+        *,
+        role: str,
+        chapter_no: int | None,
+        generated: Mapping[str, Any],
+        summary_result: Mapping[str, Any] | None = None,
+    ) -> None:
+        """写作/修订成功后记录所用模型（正文 + 摘要）。"""
+        writer_model = (self.config.writer.writer_model or "").strip() or "replyer"
+        self._append_model_credit(
+            book_dir, _llm_model_name(generated, writer_model), role, chapter_no=chapter_no
+        )
+        if summary_result is not None:
+            task = (self.config.context.summary_task or "utils").strip() or "utils"
+            self._append_model_credit(
+                book_dir, _llm_model_name(summary_result, task), "摘要", chapter_no=chapter_no
+            )
+
     def _resolve_book(
         self, kwargs: Mapping[str, Any], book: str, scope: str
     ) -> tuple[Path | None, dict[str, Any], dict[str, Any] | None]:
@@ -548,17 +688,24 @@ class MaiBookPlugin(MaiBotPlugin):
         lines.append(
             "写作纪律：\n"
             "- 只输出正文本身，不要输出解释、标题编号之外的元信息、寒暄或与正文无关的话。\n"
+            "- 每次只写当前这一章的正文，不要夹带其它章节。\n"
             "- 严格保持与既有设定、人物、前文摘要的一致性，不要凭空发明与设定冲突的关键事实。\n"
             f"- 若缺少继续写作所必需、且你无法自行合理决定的关键信息：请在回复最前面单独输出一行 {NEED_INFO_MARKER}，"
             "随后用「- 」逐条列出需要确认的问题，然后停止，不要硬编。"
         )
         return "\n\n".join(lines)
 
-    def _assemble_context(self, book_dir: Path, meta: Mapping[str, Any], task_text: str) -> str:
+    def _assemble_context(
+        self, book_dir: Path, meta: Mapping[str, Any], task_text: str, *, target_chapter: int,
+    ) -> str:
         """在字符预算内组装写作上下文（要点→大纲→人物→设定→全部自定义设定→决定→摘要→前文衔接）。
 
         这是麦麦本人的书：bible/ 下的全部设定文件（含麦麦通过 setup_bible
         自行写入的任意自定义主题）都会作为参考资料带给写手，而不只是几个固定文件。
+
+        target_chapter：本次写作/修订的章号。「上一章结尾」仅当第 target_chapter-1 章
+        已存在且非空时才注入；「下一章开头」仅当第 target_chapter+1 章已存在且非空时注入。
+        二者均严格按 N±1 取邻章，缺中间章则不带。
         """
         budget = max(2000, int(self.config.context.char_budget))
         bible_dir = book_dir / "bible"
@@ -581,12 +728,15 @@ class MaiBookPlugin(MaiBotPlugin):
                 sections.append((f"【设定·{child.stem}】", _read_text(child)))
         sections.append(("【已确认的决定（视为正典）】", _read_text(book_dir / "journal" / "decisions.md")))
         if self.config.context.include_rolling_summary:
-            summaries = self._collect_summaries(book_dir)
+            summaries = self._collect_summaries(book_dir, before_chapter=target_chapter)
             if summaries:
                 sections.append(("【此前章节摘要】", summaries))
-        prev_tail = self._previous_chapter_tail(book_dir)
+        prev_tail = self._previous_chapter_tail(book_dir, target_chapter)
         if prev_tail:
             sections.append(("【上一章结尾（用于衔接）】", prev_tail))
+        next_head = self._next_chapter_head(book_dir, target_chapter)
+        if next_head:
+            sections.append(("【下一章开头（用于衔接）】", next_head))
 
         remaining = budget - len(task_text) - 64
         included: list[str] = []
@@ -623,23 +773,30 @@ class MaiBookPlugin(MaiBotPlugin):
             )
         return "\n\n".join(included + [task_text])
 
-    def _collect_summaries(self, book_dir: Path) -> str:
+    def _collect_summaries(self, book_dir: Path, *, before_chapter: int | None = None) -> str:
         summaries_dir = book_dir / "summaries"
         if not summaries_dir.exists():
             return ""
         parts: list[str] = []
         for number in self._chapter_numbers(book_dir):
+            if before_chapter is not None and number >= before_chapter:
+                continue
             text = _read_text(summaries_dir / f"{number:02d}-chapter.md").strip()
             if text:
                 parts.append(f"第 {number} 章：{text}")
         return "\n".join(parts)
 
-    def _previous_chapter_tail(self, book_dir: Path, tail_chars: int = 1200) -> str:
-        numbers = self._chapter_numbers(book_dir)
-        if not numbers:
+    def _previous_chapter_tail(self, book_dir: Path, target_chapter: int, tail_chars: int = 1200) -> str:
+        """取第 target_chapter-1 章的结尾片段用于衔接；该章不存在或为空时返回空。"""
+        if target_chapter <= 0:
             return ""
-        text = _read_text(self._chapter_path(book_dir, numbers[-1])).strip()
+        text = _read_text(self._chapter_path(book_dir, target_chapter - 1)).strip()
         return text[-tail_chars:] if text else ""
+
+    def _next_chapter_head(self, book_dir: Path, target_chapter: int, head_chars: int = 1200) -> str:
+        """取第 target_chapter+1 章的开头片段用于衔接；该章不存在或为空时返回空。"""
+        text = _read_text(self._chapter_path(book_dir, target_chapter + 1)).strip()
+        return text[:head_chars] if text else ""
 
     async def _writer_generate(self, system: str, user: str) -> dict[str, Any]:
         """调用写手模型：优先按任务名走 ctx.llm.generate，名称无法解析时回退固定模型。"""
@@ -658,6 +815,9 @@ class MaiBookPlugin(MaiBotPlugin):
             result = {"success": False, "error": f"调用模型异常：{exc}"}
 
         if isinstance(result, dict) and result.get("success") and str(result.get("response", "")).strip():
+            if "model" not in result and "model_name" not in result:
+                result = dict(result)
+                result["model"] = model
             return result
 
         error_text = str((result or {}).get("error") or "")
@@ -722,7 +882,7 @@ class MaiBookPlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "error": f"固定模型 `{model_name}` 生成失败：{exc}"}
 
-    async def _summarize_chapter(self, title: str, chapter_no: int, chapter_text: str) -> str:
+    async def _summarize_chapter(self, title: str, chapter_no: int, chapter_text: str) -> tuple[str, dict[str, Any] | None]:
         """为单章生成滚动摘要（用速度快的小模型任务）。失败时回退为开头截断并记日志。"""
         task = (self.config.context.summary_task or "utils").strip() or "utils"
         prompt = [
@@ -740,26 +900,33 @@ class MaiBookPlugin(MaiBotPlugin):
                 prompt=prompt, model=task, temperature=0.3, max_tokens=600, timeout_ms=timeout_ms
             )
             if isinstance(result, dict) and result.get("success") and str(result.get("response", "")).strip():
-                return str(result["response"]).strip()
+                if "model" not in result and "model_name" not in result:
+                    result = dict(result)
+                    result["model"] = task
+                return str(result["response"]).strip(), result
             self.ctx.logger.warning("麦书：章节摘要生成失败，回退为截断：%s", (result or {}).get("error"))
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("麦书：章节摘要调用异常，回退为截断：%s", exc)
-        return chapter_text[:400]
+        return chapter_text[:400], None
 
     # ------------------------------------------------------------------ #
     # 写作核心（工具与后台共用）
     # ------------------------------------------------------------------ #
     async def _do_write_chapter(
-        self, book_dir: Path, meta: Mapping[str, Any], *, chapter_no: Any, brief: str, target_words: int, draft: str = ""
+        self, book_dir: Path, meta: Mapping[str, Any], *, chapter_no: Any, brief: str, target_words: int,
+        draft: str = "", overwrite: bool = False,
     ) -> dict[str, Any]:
-        """实际写一章；返回结构化结果（success / need_info / setup-not-ready）。"""
+        """实际写一章；返回结构化结果（success / need_info / setup-not-ready）。
+
+        overwrite=True 时：目标章已有正文则先快照到 .history，再完全丢弃旧稿从零生成（不把旧文带给写手）。
+        """
         if meta.get("status") != STATUS_READY:
             missing = self._readiness(book_dir, meta)
             return {
                 "success": False,
                 "status": STATUS_SETUP,
                 "missing": missing,
-                "content": "这本书还没准备好开写。请先补全以下必要信息（你可以自己拍板，拿不准再问用户），"
+                "content": "这本书还没准备好开写。请先补全以下必要信息（你可以自己拍板，拿不准再问编辑（editor）），"
                 "补全后用 review_ready 标记就绪：\n- " + "\n- ".join(missing),
             }
 
@@ -777,7 +944,25 @@ class MaiBookPlugin(MaiBotPlugin):
         instructions = _read_text(book_dir / "instructions.md")
         system = self._writer_system_prompt(persona, meta, instructions)
 
+        chapter_path = self._chapter_path(book_dir, number)
+        existing_body = _read_text(chapter_path).strip()
+        if existing_body and not overwrite:
+            return {
+                "success": False,
+                "content": f"第 {number} 章已有内容。要完全丢弃旧稿从零重写：write_chapter chapter={number} overwrite=true brief=\"…\"；"
+                f"要基于旧稿按意见修改：write_revise chapter={number} instruction=\"…\"。",
+            }
+        if existing_body and overwrite:
+            _atomic_write(book_dir / ".history" / f"{number:02d}-chapter.{_ts()}.md", existing_body + "\n")
+            old_summary = _read_text(book_dir / "summaries" / f"{number:02d}-chapter.md").strip()
+            if old_summary:
+                _atomic_write(book_dir / ".history" / f"{number:02d}-summary.{_ts()}.md", old_summary + "\n")
+
         task_lines = [f"请创作《{title}》的第 {number} 章。"]
+        if overwrite and existing_body:
+            task_lines.append(
+                "【完全重写】本章旧稿已废弃，请勿沿用或参考任何旧正文；按当前设定与大纲从零写出一版全新的正文。"
+            )
         if brief.strip():
             task_lines.append(f"本章特别要求：{brief.strip()}")
         if target_words and target_words > 0:
@@ -789,7 +974,7 @@ class MaiBookPlugin(MaiBotPlugin):
                 "在此基础上完成、润色、扩写为最终正文，不要另起炉灶或与之冲突。\n\n" + draft.strip()
             )
         task_lines.append("请直接开始写本章正文（可用「## 小节标题」分节）。")
-        user = self._assemble_context(book_dir, meta, "\n".join(task_lines))
+        user = self._assemble_context(book_dir, meta, "\n".join(task_lines), target_chapter=number)
 
         generated = await self._writer_generate(system, user)
         if not generated.get("success"):
@@ -800,11 +985,14 @@ class MaiBookPlugin(MaiBotPlugin):
         if need_info is not None:
             self._append_questions(book_dir, number, need_info)
             return {"success": True, "status": "need_info", "chapter_no": number, "questions": need_info}
-
         chapter_path = self._chapter_path(book_dir, number)
         _atomic_write(chapter_path, f"# 第 {number} 章\n\n{response_text}\n")
-        summary = await self._summarize_chapter(title, number, response_text)
+        summary, summary_result = await self._summarize_chapter(title, number, response_text)
         _atomic_write(book_dir / "summaries" / f"{number:02d}-chapter.md", summary)
+        credit_role = "重写" if overwrite and existing_body else "写作"
+        self._record_generation_credits(
+            book_dir, role=credit_role, chapter_no=number, generated=generated, summary_result=summary_result,
+        )
 
         updated = dict(meta)
         updated["status"] = STATUS_READY
@@ -812,6 +1000,7 @@ class MaiBookPlugin(MaiBotPlugin):
 
         word_count = len(re.sub(r"\s+", "", response_text))
         preview = response_text[:500] + ("……" if len(response_text) > 500 else "")
+        verb = "重写" if overwrite and existing_body else "写好"
         return {
             "success": True,
             "status": "written",
@@ -819,7 +1008,7 @@ class MaiBookPlugin(MaiBotPlugin):
             "word_count": word_count,
             "path": str(chapter_path),
             "preview": preview,
-            "content": f"已写好《{title}》第 {number} 章，约 {word_count} 字。预览：\n\n{preview}",
+            "content": f"已{verb}《{title}》第 {number} 章，约 {word_count} 字。预览：\n\n{preview}",
         }
 
     def _readiness(self, book_dir: Path, meta: Mapping[str, Any]) -> list[str]:
@@ -831,6 +1020,8 @@ class MaiBookPlugin(MaiBotPlugin):
         for name, label in REQUIRED_BIBLE.items():
             if not _read_text(book_dir / "bible" / f"{name}.md").strip():
                 missing.append(f"{label}（bible/{name}.md）")
+        if not _read_text(book_dir / "instructions.md").strip():
+            missing.append("创作说明（instructions.md，用 setup_instructions 写入）")
         return missing
 
     def _append_questions(self, book_dir: Path, chapter_no: int, questions: list[str]) -> None:
@@ -845,7 +1036,7 @@ class MaiBookPlugin(MaiBotPlugin):
     # 写一章往往要数分钟，远超宿主 plugin.invoke_tool 的 RPC 超时（约 60s）。
     # 因此写作/修订工具改为：先做快速校验并立即返回 task_id，真正的生成在后台
     # asyncio 任务里进行。任务结束后由 _surface_task_completion 主动把正文/问题
-    # 注入麦麦上下文（context.append）并唤醒她（proactive.trigger）——所以**返回语里
+    # 注入麦麦上下文（context.append）、以 text 发到聊天供编辑阅读，并唤醒她（proactive.trigger）——所以**返回语里
     # 不要叫她去轮询**，否则 planner 会反复调 write_status 直到耗光思考轮次。
     # write_status 仍保留，仅供麦麦想主动查看时用。
     def _start_task(
@@ -885,8 +1076,9 @@ class MaiBookPlugin(MaiBotPlugin):
         return {
             "success": True, "status": "running", "task_id": task_id,
             "content": f"已在后台开始{verb}《{record['title']}》{chapter_label}（{task_id}）。"
-            f"这会花上一些时间（至少一分钟），完成后你会被主动唤醒，{wrote}的正文也会自动加入你的上下文。"
-            "你可以先去做别的事了（建议一次只推进一个章节，以防前后文不搭）。",
+            f"这会花上一些时间（至少一分钟），完成后你会被主动唤醒，{wrote}的正文也会加入你的上下文并发送到聊天供编辑阅读。"
+            "你可以先去做别的事了。建议按章号顺序一次只推进一章（0→1→2…），同一本书后台同时只允许一个写作/修订任务；"
+            "跳章或并行发起多个写章虽不被工具禁止，但缺中间章时前文衔接会缺失。",
         }
 
     async def _run_task(self, task_id: str, book_key: str, runner: Any) -> None:
@@ -914,8 +1106,8 @@ class MaiBookPlugin(MaiBotPlugin):
         await self._surface_task_completion(record, book_key)
 
     async def _surface_task_completion(self, record: Mapping[str, Any], book_key: str) -> None:
-        """后台写作/修订任务结束后，主动把正文/问题注入麦麦上下文并唤醒她——
-        这样麦麦无需轮询 write_status；她被唤醒时正文已在上下文里。"""
+        """后台写作/修订任务结束后，主动把正文发到聊天、注入麦麦上下文并唤醒她——
+        这样麦麦无需轮询 write_status；编辑能在聊天里直接读到，她被唤醒时正文也在上下文里。"""
         stream_id = str(record.get("stream_id") or "")
         if not stream_id:
             return
@@ -929,11 +1121,27 @@ class MaiBookPlugin(MaiBotPlugin):
             if chapter_no is not None:
                 body = _read_text(self._chapter_path(Path(book_key), int(chapter_no))).strip()
             wc = record.get("word_count")
-            header = f"【麦书】你刚{verb}好《{title}》{chap}" + (f"（约 {wc} 字）" if wc else "") + "，正文如下："
+            sent_count, total_chunks = 0, 0
+            if body:
+                sent_count, total_chunks = await self._send_units_to_chat([(chap or "正文", body)], "text", stream_id)
+            if sent_count > 0:
+                chat_note = f"正文已以 text 分段发送到本聊天流（{sent_count}/{total_chunks} 段），编辑（editor）可直接阅读；"
+            elif body:
+                chat_note = "正文发送到聊天流失败（详见日志）；"
+                self.ctx.logger.warning(
+                    "麦书：《%s》%s 完成后未能把正文发到聊天（%d/%d 段成功）。",
+                    title, chap, sent_count, total_chunks,
+                )
+            else:
+                chat_note = ""
+            header = f"【麦书】你刚{verb}好《{title}》{chap}" + (f"（约 {wc} 字）" if wc else "") + "。"
+            if chat_note:
+                header += chat_note
+            header += "以下为你自己的上下文副本："
             content = header + "\n\n" + _clip(body) if body else (header + "\n\n" + str(record.get("detail", "")))
             await self._surface_to_mai(
                 stream_id, content,
-                intent=f"《{title}》{chap}已{verb}好，请决定是否审阅/分享/继续往下推进",
+                intent=f"《{title}》{chap}已{verb}好，请决定是否审阅/继续往下推进",
                 reason="maibook_task_done",
                 book_title=title,
             )
@@ -941,7 +1149,7 @@ class MaiBookPlugin(MaiBotPlugin):
             qs = record.get("questions") or []
             content = (
                 f"【麦书】{verb}《{title}》{chap}时，写手需要你先拍板几件事：\n- " + "\n- ".join(qs)
-                + "\n（这是你自己的书，可凭设定/记忆自行决定，拿不准再问用户；定了用 setup_answer 记入设定后再发起。）"
+                + "\n（这是你自己的书，可凭设定/记忆自行决定，拿不准再问编辑（editor）；定了用 setup_answer 记入设定后再发起。）"
             )
             await self._surface_to_mai(
                 stream_id, content,
@@ -1017,11 +1225,27 @@ class MaiBookPlugin(MaiBotPlugin):
         if status == "need_info":
             qs = rec.get("questions") or []
             line = f"{head}：⚠ 需要先拍板（写手暂停在第 {rec.get('chapter_no')} 章）：\n- " + "\n- ".join(qs)
-            line += "\n（这是你自己的书，可凭设定/记忆自行决定，拿不准再问用户；定了用 setup_answer 记入设定后再发起写作。）"
+            line += "\n（这是你自己的书，可凭设定/记忆自行决定，拿不准再问编辑（editor）；定了用 setup_answer 记入设定后再发起写作。）"
             return line
         if status == "cancelled":
             return f"{head}：已取消。"
         return f"{head}：❌ 失败 — {rec.get('error') or rec.get('detail')}"
+
+    @staticmethod
+    def _coalesce_bool(primary: Any, kwargs: Mapping[str, Any], *aliases: str) -> bool:
+        """从显式参数与常见同义键里取布尔值。"""
+        if isinstance(primary, bool):
+            if primary:
+                return True
+        elif str(primary).strip().lower() in ("true", "1", "yes", "on"):
+            return True
+        for key in aliases:
+            value = kwargs.get(key)
+            if isinstance(value, bool) and value:
+                return True
+            if str(value or "").strip().lower() in ("true", "1", "yes", "on"):
+                return True
+        return False
 
     @staticmethod
     def _coalesce_chapter(primary: Any, kwargs: Mapping[str, Any]) -> str:
@@ -1096,7 +1320,7 @@ class MaiBookPlugin(MaiBotPlugin):
 
     @Tool(
         "bookshelf_create",
-        brief_description="【麦书/maibook·书库】新建一本书（初始为 setup 状态，需补全要素后才能开写）。",
+        brief_description="【麦书/maibook·书库】新建一本书（初始为 setup 状态，需补全要素后才能开写）。建书时不预填创作说明，返回中会附带参考模板，请用 setup_instructions 写入。",
         parameters=[
             ToolParameterInfo(name="title", param_type=ToolParamType.STRING, required=True, description="书名（同时作为 ID 来源）"),
             ToolParameterInfo(name="premise", param_type=ToolParamType.STRING, required=False, default="", description="一句话核心设定/前提（可选，之后也能补）"),
@@ -1129,9 +1353,12 @@ class MaiBookPlugin(MaiBotPlugin):
         # 建好目录骨架
         for sub in ("manuscript", "bible", "summaries", "journal", "compiled"):
             (book_dir / sub).mkdir(parents=True, exist_ok=True)
-        _atomic_write(book_dir / "instructions.md", INSTRUCTIONS_TEMPLATE.format(title=title))
         _atomic_write(book_dir / "journal" / "questions.md", "")
         _atomic_write(book_dir / "journal" / "decisions.md", "")
+        _atomic_write(
+            book_dir / "journal" / "credits.md",
+            CREDITS_TEMPLATE.format(title=title, author=persona.get("nickname", "麦麦")),
+        )
 
         meta: dict[str, Any] = {
             "title": title,
@@ -1148,13 +1375,16 @@ class MaiBookPlugin(MaiBotPlugin):
         }
         self._write_meta(book_dir, meta)
         missing = self._readiness(book_dir, meta)
+        template = _instructions_template(title)
         return {
             "success": True,
             "slug": slug,
             "content": f"已建立《{title}》[slug={slug}]，作者署名「{meta['author']}」，当前为 setup（未就绪）。\n"
             "开写前还需补全：\n- " + "\n- ".join(missing)
-            + "\n\n你可以自己拟定这些要素（拿不准再问用户）：用 bookshelf_meta 填要点、setup_outline 写大纲、"
-            "setup_bible 写人物/设定，然后 review_ready 标记就绪。",
+            + "\n\n你可以自己拟定这些要素（拿不准再问编辑（editor））：用 bookshelf_meta 填要点、setup_outline 写大纲、"
+            "setup_bible 写人物/设定，用 setup_instructions 写入创作说明，然后 review_ready 标记就绪。"
+            "开写后建议按章号顺序一次推进一章。\n\n"
+            "【创作说明参考模板（请用 setup_instructions 写入，不要留空）】\n" + template,
         }
 
     @Tool(
@@ -1205,29 +1435,43 @@ class MaiBookPlugin(MaiBotPlugin):
 
     @Tool(
         "setup_instructions",
-        brief_description="【麦书/maibook·筹备】设置/覆盖本书的创作说明 instructions.md（写手每次写作都会读到）。",
+        brief_description="【麦书/maibook·筹备】写入/覆盖本书创作说明 instructions.md（开写前必填，写手每次写作都会读到）。建书返回的参考模板仅作结构提示，须用本工具写入你自己的正文；需要再看模板可加 show_template=true。",
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
-            ToolParameterInfo(name="content", param_type=ToolParamType.STRING, required=True, description="创作说明全文（Markdown）"),
+            ToolParameterInfo(name="content", param_type=ToolParamType.STRING, required=False, default="", description="创作说明全文（Markdown）"),
+            ToolParameterInfo(name="show_template", param_type=ToolParamType.BOOLEAN, required=False, default=False, description="为 true 时返回参考模板（不写入文件）；可与空 content 联用"),
             ToolParameterInfo(name="scope", param_type=ToolParamType.STRING, required=False, default="chat", enum_values=["chat", "global"], description="范围"),
         ],
     )
-    async def setup_instructions(self, book: str = "", content: str = "", scope: str = "chat", **kwargs: Any) -> dict[str, Any]:
+    async def setup_instructions(
+        self, book: str = "", content: str = "", show_template: bool = False, scope: str = "chat", **kwargs: Any
+    ) -> dict[str, Any]:
         scope = self._norm_scope(scope)
         book_dir, meta, error = self._resolve_book(kwargs, book, scope)
         if error:
             return error
         content = _coalesce_text(content, kwargs, "instructions", "text", "body", "markdown")
+        show_template = self._coalesce_bool(show_template, kwargs, "show_template", "template")
         body = str(content or "").strip()
+        title = str(meta.get("title") or book)
         if not body:
+            if show_template:
+                return {
+                    "success": True,
+                    "content": "【创作说明参考模板（请据此用 setup_instructions 写入你自己的正文）】\n"
+                    + _instructions_template(title),
+                }
             return {
                 "success": False,
-                "content": f"《{meta.get('title', book)}》的创作说明内容为空，未做任何改动。"
-                "请把正文放进 content 参数后重试（已保留原有内容）。",
+                "content": f"《{title}》的创作说明内容为空，未做任何改动。请把正文放进 content 后重试；"
+                "需要看结构模板可加 show_template=true。",
             }
         async with self._lock(book_dir):
             _atomic_write(book_dir / "instructions.md", body + "\n")
-        return {"success": True, "content": f"已更新《{meta.get('title', book)}》的创作说明。"}
+        note = ""
+        if show_template:
+            note = "\n\n【参考模板】\n" + _clip(_instructions_template(title))
+        return {"success": True, "content": f"已更新《{title}》的创作说明。{note}"}
 
     @Tool(
         "setup_outline",
@@ -1293,7 +1537,7 @@ class MaiBookPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------ #
     @Tool(
         "review_read",
-        brief_description="【麦书/maibook·审阅】读取一本书：概览/元信息/大纲/设定/正文清单/摘要/问题/决定；读某一章正文请直接传 chapter=<章号>（从 0 开始，第 0 章可作序章/楔子）。读到的内容**默认只回到你自己的上下文、不会自动发到聊天**；想顺便发到聊天就加 send=text（分段文本）或 send=png（长图）。",
+        brief_description="【麦书/maibook·审阅】读取一本书：概览/元信息/大纲/设定/正文清单/摘要/问题/决定/致谢（编辑与模型）；读某一章正文请直接传 chapter=<章号>（从 0 开始，第 0 章可作序章/楔子）。读到的内容**默认只回到你自己的上下文、不会自动发到聊天**；想顺便发到聊天就加 send=text（分段文本）或 send=png（长图）。",
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
             ToolParameterInfo(
@@ -1302,7 +1546,7 @@ class MaiBookPlugin(MaiBotPlugin):
             ),
             ToolParameterInfo(
                 name="target", param_type=ToolParamType.STRING, required=False, default="all",
-                description="不读具体某章时的读取目标：all/metadata/instructions/outline/bible/bible:<名>/manuscript/chapter:<N>/summaries/questions/decisions。读单章更推荐直接用 chapter 参数。",
+                description="不读具体某章时的读取目标：all/metadata/instructions/outline/bible/bible:<名>/manuscript/chapter:<N>/summaries/questions/decisions/credits。读单章更推荐直接用 chapter 参数。",
             ),
             ToolParameterInfo(name="scope", param_type=ToolParamType.STRING, required=False, default="chat", enum_values=["chat", "global"], description="范围"),
             ToolParameterInfo(
@@ -1369,6 +1613,8 @@ class MaiBookPlugin(MaiBotPlugin):
             return {"success": True, "content": _clip(_read_text(book_dir / "journal" / "questions.md") or "（暂无待答问题）")}
         if target == "decisions":
             return {"success": True, "content": _clip(_read_text(book_dir / "journal" / "decisions.md") or "（暂无已记录的决定）")}
+        if target == "credits":
+            return {"success": True, "content": _clip(_read_text(self._credits_path(book_dir)) or "（暂无致谢记录）")}
         if target == "summaries":
             return {"success": True, "content": _clip(self._collect_summaries(book_dir) or "（暂无摘要）")}
         if target == "manuscript":
@@ -1418,7 +1664,7 @@ class MaiBookPlugin(MaiBotPlugin):
         names = {
             "all": "概览", "overview": "概览", "metadata": "元信息", "instructions": "创作说明",
             "outline": "大纲", "bible": "设定", "manuscript": "目录", "summaries": "摘要",
-            "questions": "待答问题", "decisions": "已记录的决定",
+            "questions": "待答问题", "decisions": "已记录的决定", "credits": "致谢（编辑与模型）",
         }
         return f"《{title}》" + names.get(target, target)
 
@@ -1445,17 +1691,19 @@ class MaiBookPlugin(MaiBotPlugin):
             new_meta = dict(self._read_meta(book_dir))
             new_meta["status"] = STATUS_READY
             self._write_meta(book_dir, new_meta)
-        return {"success": True, "ready": True, "content": f"《{meta.get('title', book)}》要素齐全，已标记为 ready，可以开写了。"}
+        return {"success": True, "ready": True, "content": f"《{meta.get('title', book)}》要素齐全，已标记为 ready，可以开写了。"
+            "建议按章号顺序一次写一章（从第 0 章序章或第 1 章正文起），写完审一审再往下推进。"}
 
     # ------------------------------------------------------------------ #
     # 工具：写作与修订
     # ------------------------------------------------------------------ #
     @Tool(
         "write_chapter",
-        brief_description="【麦书/maibook·写作】为一本「已就绪」的书写一章（缺信息会回报问题而不硬写）。",
+        brief_description="【麦书/maibook·写作】为一本「已就绪」的书写一章（缺信息会回报问题而不硬写）。续写用 chapter=next；已有章节要完全丢弃旧稿从零重写须 overwrite=true；基于旧稿按意见改请用 write_revise。",
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
-            ToolParameterInfo(name="chapter", param_type=ToolParamType.STRING, required=False, default="next", description="章节号；留空或 next 表示续写下一章"),
+            ToolParameterInfo(name="chapter", param_type=ToolParamType.STRING, required=False, default="next", description="章节号；留空或 next 表示续写下一章。建议按顺序逐章写，不要跳号。"),
+            ToolParameterInfo(name="overwrite", param_type=ToolParamType.BOOLEAN, required=False, default=False, description="目标章已有正文时：true=先快照旧稿到 .history 再完全丢弃重写（不把旧文带给写手）；false=拒绝覆盖"),
             ToolParameterInfo(name="brief", param_type=ToolParamType.STRING, required=False, default="", description="本章的特别要求/要点（可选）"),
             ToolParameterInfo(name="content", param_type=ToolParamType.STRING, required=False, default="", description="麦麦为本章提供的参考稿/草稿正文（可选）；写手会以它为基准来完成本章，保留其情节与关键设定"),
             ToolParameterInfo(name="target_words", param_type=ToolParamType.INTEGER, required=False, default=0, description="目标字数（可选，0 表示不限）"),
@@ -1463,7 +1711,8 @@ class MaiBookPlugin(MaiBotPlugin):
         ],
     )
     async def write_chapter(
-        self, book: str = "", chapter: str = "next", brief: str = "", content: str = "", target_words: int = 0, scope: str = "chat", **kwargs: Any
+        self, book: str = "", chapter: str = "next", overwrite: bool = False, brief: str = "", content: str = "",
+        target_words: int = 0, scope: str = "chat", **kwargs: Any
     ) -> dict[str, Any]:
         scope = self._norm_scope(scope)
         book_dir, meta, error = self._resolve_book(kwargs, book, scope)
@@ -1474,11 +1723,12 @@ class MaiBookPlugin(MaiBotPlugin):
             missing = self._readiness(book_dir, meta)
             return {
                 "success": False, "status": STATUS_SETUP, "missing": missing,
-                "content": "这本书还没准备好开写。请先补全以下必要信息（你可以自己拍板，拿不准再问用户），"
+                "content": "这本书还没准备好开写。请先补全以下必要信息（你可以自己拍板，拿不准再问编辑（editor）），"
                 "补全后用 review_ready 标记就绪：\n- " + "\n- ".join(missing),
             }
 
         chap_input = self._coalesce_chapter(chapter, kwargs) or "next"
+        overwrite = self._coalesce_bool(overwrite, kwargs, "overwrite", "replace", "discard")
         existing = self._chapter_numbers(book_dir)
         if chap_input.strip().lower() in ("", "next"):
             planned = (existing[-1] + 1) if existing else 1
@@ -1487,7 +1737,13 @@ class MaiBookPlugin(MaiBotPlugin):
                 planned = max(0, int(chap_input))
             except (TypeError, ValueError):
                 planned = (existing[-1] + 1) if existing else 1
-        chapter_label = f"第 {planned} 章"
+        if _read_text(self._chapter_path(book_dir, planned)).strip() and not overwrite:
+            return {
+                "success": False,
+                "content": f"第 {planned} 章已有内容。要完全丢弃旧稿从零重写：write_chapter chapter={planned} overwrite=true brief=\"…\"；"
+                f"要基于旧稿按意见修改：write_revise chapter={planned} instruction=\"…\"。",
+            }
+        chapter_label = f"第 {planned} 章" + ("（丢弃重写）" if overwrite else "")
         draft = content
         words = int(target_words or 0)
 
@@ -1495,7 +1751,8 @@ class MaiBookPlugin(MaiBotPlugin):
             async with self._lock(book_dir):
                 fresh = self._read_meta(book_dir)
                 return await self._do_write_chapter(
-                    book_dir, fresh, chapter_no=chap_input, brief=brief, draft=draft, target_words=words
+                    book_dir, fresh, chapter_no=chap_input, brief=brief, draft=draft, target_words=words,
+                    overwrite=overwrite,
                 )
 
         return self._start_task(
@@ -1505,17 +1762,18 @@ class MaiBookPlugin(MaiBotPlugin):
 
     @Tool(
         "write_revise",
-        brief_description="【麦书/maibook·写作】修订已写好的某一章（整章重写，或仅重写指定小节）；修订前自动快照到 .history。",
+        brief_description="【麦书/maibook·写作】修订已写好的某一章（整章重写，或仅重写指定小节）；修订前自动快照到 .history，写手会看到旧稿。要完全丢弃旧稿从零写请用 write_chapter overwrite=true。",
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
             ToolParameterInfo(name="chapter", param_type=ToolParamType.INTEGER, required=True, description="要修订的章节号"),
             ToolParameterInfo(name="instruction", param_type=ToolParamType.STRING, required=True, description="修订要求（怎么改）"),
+            ToolParameterInfo(name="editor", param_type=ToolParamType.STRING, required=False, default="", description="提出修订意见的编辑（editor）；留空则尝试从当前聊天上下文识别"),
             ToolParameterInfo(name="target_section", param_type=ToolParamType.STRING, required=False, default="", description="只改某个「## 小节标题」时填该标题；留空则整章重写"),
             ToolParameterInfo(name="scope", param_type=ToolParamType.STRING, required=False, default="chat", enum_values=["chat", "global"], description="范围"),
         ],
     )
     async def write_revise(
-        self, book: str = "", chapter: int = 0, instruction: str = "", target_section: str = "", scope: str = "chat", **kwargs: Any
+        self, book: str = "", chapter: int = 0, instruction: str = "", editor: str = "", target_section: str = "", scope: str = "chat", **kwargs: Any
     ) -> dict[str, Any]:
         scope = self._norm_scope(scope)
         book_dir, meta, error = self._resolve_book(kwargs, book, scope)
@@ -1543,6 +1801,7 @@ class MaiBookPlugin(MaiBotPlugin):
             return {"success": False, "content": f"在第 {number} 章里找不到小节「## {section}」。"}
 
         chapter_label = f"第 {number} 章" + (f"·小节「{section}」" if section else "")
+        editor_info = _resolve_editor(kwargs, editor)
 
         async def _runner() -> dict[str, Any]:
             persona = await self._persona()
@@ -1563,7 +1822,7 @@ class MaiBookPlugin(MaiBotPlugin):
                     f"下面是《{fresh_meta.get('title','')}》第 {number} 章的原文，请按要求整章重写（只输出重写后的正文）。\n\n"
                     f"修订要求：{instruction}\n\n原文：\n{cur}"
                 )
-            user = self._assemble_context(book_dir, fresh_meta, task)
+            user = self._assemble_context(book_dir, fresh_meta, task, target_chapter=number)
 
             generated = await self._writer_generate(system, user)
             if not generated.get("success"):
@@ -1580,8 +1839,15 @@ class MaiBookPlugin(MaiBotPlugin):
                 else:
                     merged = new_text if new_text.startswith("#") else f"# 第 {number} 章\n\n{new_text}\n"
                 _atomic_write(chapter_path, merged)
-                summary = await self._summarize_chapter(str(fresh_meta.get("title", "")), number, merged)
+                summary, summary_result = await self._summarize_chapter(str(fresh_meta.get("title", "")), number, merged)
                 _atomic_write(book_dir / "summaries" / f"{number:02d}-chapter.md", summary)
+                self._record_generation_credits(
+                    book_dir, role="修订", chapter_no=number, generated=generated, summary_result=summary_result,
+                )
+                if editor_info:
+                    self._append_editor_credit(
+                        book_dir, editor_info, topic=f"第 {number} 章修订", note=instruction[:80] or "修订意见"
+                    )
 
             return {
                 "success": True, "chapter_no": number,
@@ -1654,18 +1920,19 @@ class MaiBookPlugin(MaiBotPlugin):
 
     @Tool(
         "setup_answer",
-        brief_description="【麦书/maibook·筹备】把一个已拍板的决定写入正典（decisions.md，并按需归入某个 bible 设定），随后清空待答问题。",
+        brief_description="【麦书/maibook·筹备】把一个已拍板的决定写入正典（decisions.md，并按需归入某个 bible 设定），随后清空待答问题；参与讨论的编辑会记入 credits.md 致谢。",
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
             ToolParameterInfo(name="topic", param_type=ToolParamType.STRING, required=True, description="这个决定的主题/小标题"),
             ToolParameterInfo(name="answer", param_type=ToolParamType.STRING, required=True, description="拍板的内容/决定"),
+            ToolParameterInfo(name="editor", param_type=ToolParamType.STRING, required=False, default="", description="给出此建议的编辑（editor）昵称；留空则尝试从当前聊天上下文识别"),
             ToolParameterInfo(name="bible_topic", param_type=ToolParamType.STRING, required=False, default="", description="若该决定也属于某项设定，填 bible 主题名（如 characters/world），会一并追加"),
             ToolParameterInfo(name="clear_questions", param_type=ToolParamType.BOOLEAN, required=False, default=True, description="是否清空该书的待答问题列表"),
             ToolParameterInfo(name="scope", param_type=ToolParamType.STRING, required=False, default="chat", enum_values=["chat", "global"], description="范围"),
         ],
     )
     async def setup_answer(
-        self, book: str = "", topic: str = "", answer: str = "", bible_topic: str = "",
+        self, book: str = "", topic: str = "", answer: str = "", editor: str = "", bible_topic: str = "",
         clear_questions: bool = True, scope: str = "chat", **kwargs: Any,
     ) -> dict[str, Any]:
         scope = self._norm_scope(scope)
@@ -1676,6 +1943,7 @@ class MaiBookPlugin(MaiBotPlugin):
         answer = str(answer or "").strip()
         if not answer:
             return {"success": False, "content": "请提供拍板的内容（answer）。"}
+        editor_info = _resolve_editor(kwargs, editor)
         async with self._lock(book_dir):
             meta = self._read_meta(book_dir)
             decisions_path = book_dir / "journal" / "decisions.md"
@@ -1690,7 +1958,12 @@ class MaiBookPlugin(MaiBotPlugin):
                 _atomic_write(bible_path, merged + "\n")
             if clear_questions:
                 _atomic_write(book_dir / "journal" / "questions.md", "")
-        return {"success": True, "content": f"已把「{topic}」记入《{meta.get('title', book)}》的正典设定。"}
+            if editor_info:
+                self._append_editor_credit(book_dir, editor_info, topic=topic, note="编辑建议")
+        credit_note = ""
+        if editor_info:
+            credit_note = f" 编辑 {editor_info['display']} 已记入致谢。"
+        return {"success": True, "content": f"已把「{topic}」记入《{meta.get('title', book)}》的正典设定。{credit_note}"}
 
     # ------------------------------------------------------------------ #
     # 工具：交付与封面
@@ -1724,6 +1997,10 @@ class MaiBookPlugin(MaiBotPlugin):
             title = str(meta.get("title", book))
             version = str(meta.get("version", "0.1.0"))
             compiled = "\n\n".join(text for _, text in units)
+            if chapter_no < 0:
+                credits = _read_text(self._credits_path(book_dir)).strip()
+                if credits:
+                    compiled = compiled + "\n\n---\n\n" + credits
             out_path = book_dir / "compiled" / f"{_safe_component(title) or book}-v{version}.md"
             _atomic_write(out_path, compiled + "\n")
             return {"success": True, "path": str(out_path), "content": f"已编译《{title}》到本地文件：\n{out_path}"}
@@ -1880,7 +2157,7 @@ class MaiBookPlugin(MaiBotPlugin):
 
     @Tool(
         "publish_cover",
-        brief_description="【麦书/maibook·交付】渲染本书封面并直接送入上下文（供你和用户一起打磨）；可传 style 调整观感后反复迭代。",
+        brief_description="【麦书/maibook·交付】渲染本书封面并直接送入上下文（供你和编辑（editor）一起打磨）；可传 style 调整观感后反复迭代。",
         parameters=[
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
             ToolParameterInfo(name="style", param_type=ToolParamType.STRING, required=False, default="", description="封面观感/风格描述（可选；不同描述会得到不同配色，便于迭代）"),

@@ -21,7 +21,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import plugin as plugin_module  # noqa: E402
-from plugin import MaiBookPlugin  # noqa: E402
+from plugin import MaiBookPlugin, _atomic_write  # noqa: E402
 
 PERSONA = {
     "bot.nickname": "麦麦",
@@ -139,7 +139,7 @@ async def main() -> None:
     p._set_context(build_ctx(llm, counters))  # noqa: SLF001 - 测试注入
     p.config.storage.data_dir = str(tmp)
 
-    kw = {"stream_id": "test:group:42"}
+    kw = {"stream_id": "test:group:42", "user_id": "10001", "user_nickname": "林编辑"}
 
     # 1) 新建书
     r = await p.bookshelf_create(title="星海拾遗", genre="奇幻", autopilot=True, scope="chat", **kw)
@@ -147,6 +147,12 @@ async def main() -> None:
     slug = r["slug"]
     book_dir = p._book_dir("chat", kw["stream_id"], slug)
     check(p._meta_path(book_dir).exists(), "book.toml 应存在", str(book_dir))
+    check((book_dir / "journal" / "credits.md").exists(), "新建书应初始化 credits.md")
+    check(
+        not (book_dir / "instructions.md").exists() or not (book_dir / "instructions.md").read_text(encoding="utf-8").strip(),
+        "建书不应预填 instructions.md",
+    )
+    check("setup_instructions" in r["content"] and "创作说明参考模板" in r["content"], "建书返回应提示写创作说明并附带模板", r)
 
     # 2) 未就绪时拒绝写作
     r = await p.write_chapter(book=slug, **kw)
@@ -192,6 +198,8 @@ async def main() -> None:
     # 4c) 回归：set_instructions 同样不得静默写空/谎报成功，且容忍 instructions 别名。
     r = await p.setup_instructions(book=slug, content="   ", **kw)
     check(not r["success"], "空 set_instructions 应明确报错", r)
+    r_tpl = await p.setup_instructions(book=slug, show_template=True, **kw)
+    check(r_tpl["success"] and "创作说明参考模板" in r_tpl["content"], "show_template 应返回参考模板", r_tpl)
     r = await p.setup_instructions(book=slug, instructions="# 写作说明\n保持温暖。", **kw)
     check(r["success"], "set_instructions 用 instructions 别名应成功", r)
     check(
@@ -209,8 +217,8 @@ async def main() -> None:
     r = await p.review_ready(book=slug, **kw)
     check(r.get("ready") is True, "check_ready 应通过", r)
 
-    # 6) 写第 1 章（异步：工具立即返回 task_id，后台生成；完成后主动唤醒麦麦并把正文注入上下文）
-    ap0, tr0 = counters["append"], counters["trigger"]
+    # 6) 写第 1 章（异步：工具立即返回 task_id，后台生成；完成后主动唤醒麦麦、注入上下文并 text 发到聊天）
+    ap0, tr0, tx0 = counters["append"], counters["trigger"], counters["text"]
     started = await p.write_chapter(book=slug, **kw)
     check(started.get("task_id") and started.get("status") == "running", "write_chapter 应立即返回进行中的 task_id", started)
     check(
@@ -220,13 +228,15 @@ async def main() -> None:
     )
     rec = await finish(p, started)
     check(rec["status"] == "done" and rec["chapter_no"] == 1 and (rec.get("word_count") or 0) > 0, "写第 1 章应完成", rec)
+    credits_after_write = (book_dir / "journal" / "credits.md").read_text(encoding="utf-8")
+    check("创作模型（Models）" in credits_after_write and "replyer" in credits_after_write, "写作后应记录所用模型", credits_after_write)
     check(p._chapter_path(book_dir, 1).exists(), "第 1 章文件应存在")
     check((book_dir / "summaries" / "01-chapter.md").exists(), "第 1 章摘要应存在")
-    # 6a) 完成后应主动 append 正文 + trigger 唤醒各一次（而非等麦麦轮询）
+    # 6a) 完成后应主动 append 正文 + trigger 唤醒 + text 发到聊天各一次（而非等麦麦轮询）
     check(
-        counters["append"] == ap0 + 1 and counters["trigger"] == tr0 + 1,
-        "写作完成应主动注入上下文并唤醒麦麦（context.append + proactive.trigger 各一次）",
-        (ap0, tr0, counters),
+        counters["append"] == ap0 + 1 and counters["trigger"] == tr0 + 1 and counters["text"] > tx0,
+        "写作完成应注入上下文、唤醒麦麦并把正文 text 发到聊天",
+        (ap0, tr0, tx0, counters),
     )
     # 6b) 任务状态工具仍保留（可选，供麦麦主动查看）
     st = await p.write_status(task_id=started["task_id"], **kw)
@@ -234,6 +244,7 @@ async def main() -> None:
     # 6c) 回归：直接用 chapter 参数读某一章正文（之前传 chapter 会被忽略而返回概览）
     rd = await p.review_read(book=slug, chapter=1, **kw)
     check(rd["success"] and "启程" in rd["content"], "review_read 用 chapter 参数应读到该章正文", rd)
+    check(not p._previous_chapter_tail(book_dir, 1), "无第 0 章时第 1 章不应有上一章尾巴")
     # 6d) 第 0 章（序章/楔子）：可写、可读；只有负数章号才报错
     started0 = await p.write_chapter(book=slug, chapter="0", **kw)
     rec0 = await finish(p, started0)
@@ -252,6 +263,24 @@ async def main() -> None:
     check(rd_send.get("sent_to_chat", 0) > 0 and "发送到聊天" in rd_send["content"], "send=text 返回应注明已发聊天", rd_send)
     check("启程" in rd_send["content"], "send=text 后正文仍应留在返回里（供你的上下文）", rd_send)
 
+    # 6f) 回归：写/改第 0 章时不应带上全书最后一章的「上一章结尾」
+    ch1_marker = "ONLY_CHAPTER_ONE_ENDING_TAIL_MARKER"
+    _atomic_write(p._chapter_path(book_dir, 1), f"# 第 1 章\n\n尾声情节。\n\n{ch1_marker}")
+    llm.writer_prompts.clear()
+    rec0r = await finish(p, await p.write_revise(book=slug, chapter=0, instruction="序章更抓人", **kw))
+    check(rec0r["status"] == "done", "修订第 0 章应完成", rec0r)
+    prompt0 = llm.writer_prompts[-1]
+    check("【上一章结尾" not in prompt0, "改第 0 章时不应注入「上一章结尾」区块", prompt0[-800:])
+    check("【下一章开头" in prompt0 and ch1_marker in prompt0, "改第 0 章且第 1 章存在时应注入第 1 章开头", prompt0[-800:])
+    # 6g) 回归：上一章严格指 target-1；缺中间章则不带衔接尾巴
+    ch5_marker = "ONLY_CHAPTER_FIVE_ENDING_TAIL_MARKER"
+    _atomic_write(p._chapter_path(book_dir, 5), f"# 第 5 章\n\n{ch5_marker}")
+    check(not p._previous_chapter_tail(book_dir, 5), "仅有第 1、5 章时第 5 章不应有上一章尾巴（缺第 4 章）")
+    check(ch1_marker in p._previous_chapter_tail(book_dir, 2), "写第 2 章时应严格取第 1 章结尾")
+    check(ch5_marker not in p._previous_chapter_tail(book_dir, 2), "写第 2 章时不应取第 5 章结尾")
+    check(not p._next_chapter_head(book_dir, 1), "缺第 2 章时修订第 1 章不应有下一章开头")
+    check(not p._next_chapter_head(book_dir, 3), "缺第 4 章时第 3 章不应有下一章开头（虽有第 5 章）")
+
     # 7) NEED_INFO：不落稿，问题入档（异步）
     llm.mode = "need_info"
     started = await p.write_chapter(book=slug, chapter="2", **kw)
@@ -266,6 +295,8 @@ async def main() -> None:
     check(r["success"], "record_answer 应成功", r)
     check((book_dir / "journal" / "decisions.md").read_text(encoding="utf-8").strip() != "", "决定应写入 decisions.md")
     check((book_dir / "journal" / "questions.md").read_text(encoding="utf-8").strip() == "", "问题应被清空")
+    credits_after_answer = (book_dir / "journal" / "credits.md").read_text(encoding="utf-8")
+    check("林编辑" in credits_after_answer and "编辑（Editor）" in credits_after_answer, "setup_answer 应把编辑记入 credits", credits_after_answer)
 
     # 9) 修订第 1 章 → 历史快照（异步）
     started = await p.write_revise(book=slug, chapter=1, instruction="开头更紧凑一些", **kw)
@@ -290,6 +321,26 @@ async def main() -> None:
     check("共生律" in writer_prompt, "自定义 bible 设定（非固定槽位）应进入写手上下文", writer_prompt[-400:])
     check("罗盘在掌心发烫" in writer_prompt, "本章参考稿（content）应进入写手上下文", writer_prompt[-400:])
     check(llm.last_writer_kwargs.get("timeout_ms") == 600000, "写手调用应透传可配置超时 timeout_ms", llm.last_writer_kwargs)
+
+    # 9b2) 回归：写/改较早章节时，若第 target+1 章存在，应带上其开头作衔接参考
+    ch2_head_marker = "ONLY_CHAPTER_TWO_OPENING_HEAD_MARKER"
+    _atomic_write(p._chapter_path(book_dir, 2), f"# 第 2 章\n\n{ch2_head_marker}\n\n第二章正文。")
+    check(ch2_head_marker in p._next_chapter_head(book_dir, 1), "写/改第 1 章时应能取第 2 章开头")
+    llm.writer_prompts.clear()
+    rec1r = await finish(p, await p.write_revise(book=slug, chapter=1, instruction="结尾与下章衔接", **kw))
+    check(rec1r["status"] == "done", "带下一章开头的修订应完成", rec1r)
+    prompt1r = llm.writer_prompts[-1]
+    check(ch2_head_marker in prompt1r, "修订第 1 章时上下文应含第 2 章开头", prompt1r[-800:])
+    check("【下一章开头" in prompt1r, "修订时应注入「下一章开头」区块", prompt1r[-800:])
+    llm.writer_prompts.clear()
+    dup_w = await p.write_chapter(book=slug, chapter="1", brief="不应静默覆盖", **kw)
+    check(not dup_w.get("task_id") and not dup_w["success"], "已有章节时 write_chapter 未设 overwrite 应拒绝", dup_w)
+    hist_before = len(list((book_dir / ".history").glob("01-chapter.*.md")))
+    started_w1 = await p.write_chapter(book=slug, chapter="1", overwrite=True, brief="重写", **kw)
+    rec_w1 = await finish(p, started_w1)
+    check(rec_w1["status"] == "done", "overwrite 写第 1 章应完成", rec_w1)
+    check(len(list((book_dir / ".history").glob("01-chapter.*.md"))) > hist_before, "overwrite 应先快照旧稿到 .history")
+    check(ch2_head_marker in llm.writer_prompts[-1], "写已有后续章时也应注入第 2 章开头", llm.writer_prompts[-1][-800:])
 
     # 9c) 回归：写作上下文超字符预算时必须告警，不得静默丢弃 bible 设定/参考资料。
     captured_warnings: list[str] = []
@@ -326,22 +377,24 @@ async def main() -> None:
     gate = asyncio.Event()
     llm.gate = gate
     base = len(llm.writer_prompts)
-    started = await p.write_chapter(book=slug, chapter="3", **kw)
+    started = await p.write_chapter(book=slug, chapter="4", **kw)
     check(started.get("status") == "running" and started.get("task_id"), "写作发起应立即返回（不阻塞）", started)
     reached = await pump(lambda: len(llm.writer_prompts) > base)  # 后台任务推进到写手调用（被 gate 挡住）
     check(reached, "后台任务应在不阻塞工具的情况下进入写手生成阶段", None)
     st = await p.write_status(book=slug, **kw)
     check(st.get("running", 0) >= 1, "task_status 应显示有进行中的任务", st)
-    dup = await p.write_chapter(book=slug, chapter="3", **kw)
+    dup = await p.write_chapter(book=slug, chapter="4", **kw)
     check(dup.get("task_id") == started["task_id"], "同书已有进行中的任务时应复用该 task_id 而非另起", dup)
     gate.set()
     llm.gate = None
     rec = await finish(p, started)
-    check(rec["status"] == "done" and rec["chapter_no"] == 3, "放行后任务应完成第 3 章", rec)
+    check(rec["status"] == "done" and rec["chapter_no"] == 4, "放行后任务应完成第 4 章", rec)
 
     # 10) 三种交付
     r = await p.publish_deliver(book=slug, format="disk", **kw)
     check(r["success"] and Path(r["path"]).exists(), "disk 交付应产出文件", r)
+    compiled_text = Path(r["path"]).read_text(encoding="utf-8")
+    check("致谢" in compiled_text and "创作模型（Models）" in compiled_text, "整本 disk 交付应附带 credits 致谢", compiled_text[-600:])
     r = await p.publish_deliver(book=slug, format="text", **kw)
     check(r["success"] and counters["text"] > 0, "text 交付应直接发送", (r, counters))
     r = await p.publish_deliver(book=slug, format="png", **kw)
