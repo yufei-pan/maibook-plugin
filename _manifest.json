@@ -33,6 +33,11 @@
       "type": "python_package",
       "name": "tomli-w",
       "version_spec": ">=1.0.0"
+    },
+    {
+      "type": "python_package",
+      "name": "Pillow",
+      "version_spec": ">=10.0.0"
     }
   ],
   "capabilities": [

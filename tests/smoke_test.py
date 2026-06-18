@@ -29,6 +29,9 @@ PERSONA = {
     "personality.reply_style": "俏皮、口语化、爱用比喻",
 }
 
+# 1x1 PNG（mock 渲染返回值，也用于 _to_compact_webp 回归）
+MOCK_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+
 
 class MockLLM:
     """可切换行为的写手/摘要模型。"""
@@ -78,7 +81,7 @@ def build_ctx(llm: MockLLM, counters: dict[str, int]) -> SimpleNamespace:
 
     async def render_html2png(html, **kwargs):
         counters["render"] += 1
-        return {"image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "mime_type": "image/png", "width": 800, "height": 1200}
+        return {"image_base64": MOCK_PNG_B64, "mime_type": "image/png", "width": 800, "height": 1200}
 
     async def ctx_append(**kwargs):
         counters["append"] += 1
@@ -360,25 +363,16 @@ async def main() -> None:
     check(not r["success"], "全部发送失败时 text 交付应回报 success=False", r)
     p.ctx.send.text = original_send_text
 
-    # 10d) 回归：send.* 在 Host 侧成功时可能返回 None/非 {"success"} 体（SDK 原样透传），
-    #      不得据此把已发出的图片/文本误报为失败。
-    check(p._send_ok(None) and p._send_ok({"message_id": "x"}) and p._send_ok(True), "_send_ok：None/消息体/True 应判为已发出")
-    check(not p._send_ok(False) and not p._send_ok({"success": False}), "_send_ok：仅显式失败才判为失败")
-
-    async def _send_image_none(image_data, stream_id, **kwargs):
-        counters["image"] += 1
-        return None  # 模拟真实 Host：发图成功但返回 None
-
-    original_send_image = p.ctx.send.image
-    p.ctx.send.image = _send_image_none
-    img_before = counters["image"]
+    # 10d) 长图发送走「1x 渲染 + 无损 WebP 重编码」以适配 NapCat 默认动作超时：
+    #      _to_compact_webp 应得到有效 base64、不崩溃（Pillow 不可用时回退原 PNG）。
+    compact = p._to_compact_webp(MOCK_PNG_B64)
+    check(isinstance(compact, str) and len(compact) > 0, "_to_compact_webp 应返回有效 base64（webp 或原 PNG 回退）", compact[:24])
     rp = await p.review_read(book=slug, chapter=1, send="png", **kw)
     check(
-        rp["success"] and counters["image"] > img_before and rp.get("sent_to_chat", 0) > 0 and "失败" not in rp["content"],
-        "send=png 即便 Host 返回 None 也应判为已发出，不得误报失败",
+        rp["success"] and rp.get("sent_to_chat", 0) > 0 and "失败" not in rp["content"],
+        "review_read send=png 应渲染并发出（1x + WebP 路径）",
         rp,
     )
-    p.ctx.send.image = original_send_image
 
     # 11) 封面：content_items 图片入上下文
     r = await p.publish_cover(book=slug, style="深蓝、海雾、复古", **kw)

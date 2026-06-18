@@ -78,6 +78,8 @@
 落盘单文件 `.md`（推荐，路径在本机）/ 直接分段发文本（**绕过回复管线，避免被其它插件改写**）/ 渲染为长图。
 封面则走另一条路：以 `content_items` 图片**返回到上下文**（参照 fetch-url 的做法），让麦麦和用户都能看到并据此迭代。
 
+发到聊天的长图特意**控制体积**：以 1x 像素比渲染（`render.html2png` 默认 2x，会让黑白文字长图体积翻几倍），再用 **Pillow 无损 WebP** 重编码。这样在 NapCat 默认约 15s 的动作超时内也能传完——否则动作其实已送达、却因回执超时被宿主误报「发送失败」（日志里是 `[SendService] Platform IO 发送失败 … error=`，空 error 即回执超时）。Pillow 缺失时回退原 PNG 并告警。
+
 ## 配置项（`config.toml`）
 
 - `[plugin]`：`enabled`、`config_version`、`allow_autopilot`（后台自动续写**总开关**）
@@ -107,14 +109,14 @@
 ln -s /path/to/maibook-plugin /path/to/MaiBot/plugins/maibook-plugin
 ```
 
-依赖：`tomli-w`（写 TOML；读用标准库 `tomllib`，需 Python 3.11+）。已在 `_manifest.json` 声明。
+依赖：`tomli-w`（写 TOML；读用标准库 `tomllib`，需 Python 3.11+）、`Pillow`（把发到聊天的长图无损重编码为 WebP 以控制体积）。均已在 `_manifest.json` 声明。
 
 ## 测试
 
 用 uv 跑冒烟测试（mock 掉 ctx，走通主流程）：
 
 ```bash
-uv run --with tomli-w --with-editable ../maibot-plugin-sdk python tests/smoke_test.py
+uv run --with tomli-w --with pillow --with-editable ../maibot-plugin-sdk python tests/smoke_test.py
 ```
 
 ## 设计取舍

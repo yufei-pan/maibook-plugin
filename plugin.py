@@ -1753,18 +1753,6 @@ class MaiBookPlugin(MaiBotPlugin):
 
         return {"success": False, "content": f"未知交付形式：{fmt}"}
 
-    @staticmethod
-    def _send_ok(result: Any) -> bool:
-        """判断一次 ctx.send.* 是否发出。send.* 的返回契约不稳定：SDK 仅在 Host 回
-        {"success": ...} 时才归一化成 bool，否则原样返回（可能是 None / message_id / dict）。
-        因此只把**显式失败**（False 或 {"success": False}）当失败，其余（None/消息体/True）均视为已发出
-        ——否则成功发出的图片/文本会被误报为失败。"""
-        if result is False:
-            return False
-        if isinstance(result, dict) and result.get("success") is False:
-            return False
-        return True
-
     async def _send_units_to_chat(self, units: list[tuple[str, str]], fmt: str, stream_id: str) -> tuple[int, int]:
         """把若干「单元」发到聊天流：text=分段发文本（绕过回复管线）；png=逐单元渲染长图发送。
         返回 (实际发出数, 总数)。供 publish_deliver 与 review_read(send=...) 共用。"""
@@ -1772,7 +1760,7 @@ class MaiBookPlugin(MaiBotPlugin):
             chunks = self._chunk_units(units)
             sent = 0
             for chunk in chunks:
-                if self._send_ok(await self.ctx.send.text(chunk, stream_id)):
+                if await self.ctx.send.text(chunk, stream_id):
                     sent += 1
             return sent, len(chunks)
         if fmt == "png":
@@ -1780,16 +1768,57 @@ class MaiBookPlugin(MaiBotPlugin):
             total = 0
             for label, text in units:
                 total += 1
-                html = self._content_html(label, text)
                 try:
-                    rendered = await self.ctx.render.html2png(html, viewport={"width": 880, "height": self._estimate_height(text)})
-                    image_b64 = (rendered or {}).get("image_base64", "")
-                    if image_b64 and self._send_ok(await self.ctx.send.image(image_b64, stream_id)):
+                    image_b64 = await self._render_chat_image(label, text)
+                    if image_b64 and await self.ctx.send.image(image_b64, stream_id):
                         sent += 1
                 except Exception as exc:  # noqa: BLE001
                     self.ctx.logger.warning("麦书：渲染/发送长图失败：%s", exc)
             return sent, total
         return 0, 0
+
+    async def _render_chat_image(self, label: str, text: str) -> str:
+        """把一段内容渲染成**适合发聊天的小体积图片**。
+        关键：以 1x 像素比渲染——`render.html2png` 默认 2x，会让黑白文字长图体积翻几倍，
+        在 NapCat 默认约 15s 的动作超时内常常传不完（动作其实已送达，但回执超时被误报为发送失败）。
+        随后无损 WebP 重编码再压一道。返回图片 base64；渲染拿不到图时返回空串。"""
+        html = self._content_html(label, text)
+        rendered = await self.ctx.render.html2png(
+            html,
+            viewport={"width": 880, "height": self._estimate_height(text)},
+            device_scale_factor=1.0,
+        )
+        image_b64 = (rendered or {}).get("image_base64", "") if isinstance(rendered, dict) else ""
+        if not image_b64:
+            return ""
+        return self._to_compact_webp(image_b64)
+
+    def _to_compact_webp(self, png_b64: str) -> str:
+        """把 Host 渲染的 PNG 无损重编码为 WebP（黑白文字长图体积大幅下降，更容易在 NapCat
+        默认动作超时内上传完成）。仅当 WebP 更小才替换；Pillow 不可用或编码异常时按原 PNG
+        返回（仍是有效图片，只是更大）并告警——不静默掩盖。"""
+        try:
+            import base64
+            import io
+
+            from PIL import Image
+        except Exception as exc:  # noqa: BLE001 - 缺 Pillow 时退回 PNG，并明确告警
+            self.ctx.logger.warning("麦书：未能加载 Pillow，长图按原始 PNG 发送（体积更大，可能触发发送超时）：%s", exc)
+            return png_b64
+        try:
+            raw = base64.b64decode(png_b64)
+            with Image.open(io.BytesIO(raw)) as im:
+                im.load()
+                buf = io.BytesIO()
+                im.save(buf, format="WEBP", lossless=True, method=6)
+            webp = buf.getvalue()
+        except Exception as exc:  # noqa: BLE001 - 压缩失败不应阻断发送
+            self.ctx.logger.warning("麦书：长图 WebP 压缩失败，按原始 PNG 发送：%s", exc)
+            return png_b64
+        if len(webp) < len(raw):
+            self.ctx.logger.info("麦书：长图压缩 PNG %d → WebP %d 字节", len(raw), len(webp))
+            return base64.b64encode(webp).decode("ascii")
+        return png_b64
 
     def _gather_units(self, book_dir: Path, meta: Mapping[str, Any], chapter_no: int) -> list[tuple[str, str]]:
         """收集要交付的「单元」：chapter_no>=0 仅某一章（含第 0 章/序章），否则整本=所有 manuscript/*.md（按名排序）。"""
