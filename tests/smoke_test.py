@@ -36,12 +36,16 @@ class MockLLM:
     def __init__(self) -> None:
         self.mode = "normal"  # normal | need_info | unknown_task
         self.models: list[str] = []
+        self.writer_prompts: list[str] = []  # 记录写手（非摘要）调用收到的完整提示词
+        self.last_writer_kwargs: dict = {}  # 记录写手调用收到的额外参数（用于校验 timeout_ms 透传）
 
     async def generate(self, prompt, model="", temperature=None, max_tokens=None, **kwargs):
         self.models.append(model)
         text = prompt if isinstance(prompt, str) else " ".join(str(item.get("content", "")) for item in prompt)
         if "编辑助手" in text:  # 摘要任务
             return {"success": True, "response": "（摘要）林夏带着会说话的罗盘启程，立下寻找沉城的目标。", "model": model}
+        self.writer_prompts.append(text)
+        self.last_writer_kwargs = dict(kwargs)
         if self.mode == "unknown_task":
             return {"success": False, "error": f"未找到名为 `{model}` 的模型配置"}
         if self.mode == "need_info":
@@ -203,6 +207,53 @@ async def main() -> None:
     r = await p.maibook_revise(book=slug, chapter=1, instruction="开头更紧凑一些", **kw)
     check(r["success"], "revise 应成功", r)
     check(list((book_dir / ".history").glob("01-chapter.*.md")), "修订应留下历史快照")
+
+    # 9b) 回归：bible/ 下的全部自定义设定 + 本章参考稿都要进入写手上下文，且超时可配置透传。
+    check(
+        (await p.maibook_add_bible_note(book=slug, topic="logic-theory", content="共生律：碎片以伪随机噪声互证存在。", **kw))["success"],
+        "add_bible_note(自定义主题) 应成功",
+    )
+    p.config.writer.timeout_seconds = 600
+    llm.writer_prompts.clear()
+    r = await p.maibook_write_chapter(
+        book=slug, chapter="2", content="## 风暴\n罗盘在掌心发烫，林夏盯着翻涌的海平线。", **kw
+    )
+    check(r["success"] and r.get("chapter_no") == 2, "带参考稿写第 2 章应成功", r)
+    writer_prompt = llm.writer_prompts[-1]
+    check("共生律" in writer_prompt, "自定义 bible 设定（非固定槽位）应进入写手上下文", writer_prompt[-400:])
+    check("罗盘在掌心发烫" in writer_prompt, "本章参考稿（content）应进入写手上下文", writer_prompt[-400:])
+    check(llm.last_writer_kwargs.get("timeout_ms") == 600000, "写手调用应透传可配置超时 timeout_ms", llm.last_writer_kwargs)
+
+    # 9c) 回归：写作上下文超字符预算时必须告警，不得静默丢弃 bible 设定/参考资料。
+    captured_warnings: list[str] = []
+
+    class _WarnCapture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured_warnings.append(record.getMessage())
+
+    cap_handler = _WarnCapture(level=logging.WARNING)
+    p.ctx.logger.addHandler(cap_handler)
+    original_level = p.ctx.logger.level
+    p.ctx.logger.setLevel(logging.WARNING)
+    original_budget = p.config.context.char_budget
+    try:
+        big_lore = "潮汐魔法的细则与禁忌，逐条记录绝不能写错的关键事实。" * 200  # 远超最小预算，强制裁剪
+        check(
+            (await p.maibook_add_bible_note(book=slug, topic="big-lore", content=big_lore, **kw))["success"],
+            "add_bible_note(big-lore) 应成功",
+        )
+        p.config.context.char_budget = 2000  # 最小预算，强制超预算裁剪
+        r = await p.maibook_revise(book=slug, chapter=1, instruction="再紧凑一点", **kw)
+        check(r["success"], "超预算时 revise 仍应成功（仅裁剪、不报错）", r)
+        check(
+            any("字符预算" in msg for msg in captured_warnings),
+            "上下文超预算裁剪时应产生告警（不得静默丢弃设定/参考资料）",
+            captured_warnings,
+        )
+    finally:
+        p.config.context.char_budget = original_budget
+        p.ctx.logger.setLevel(original_level)
+        p.ctx.logger.removeHandler(cap_handler)
 
     # 10) 三种交付
     r = await p.maibook_deliver(book=slug, format="disk", **kw)

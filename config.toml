@@ -5,7 +5,7 @@
 # 是否启用插件
 enabled = true
 # 配置版本号（请勿手动随意修改）
-config_version = "0.1.0"
+config_version = "0.2.0"
 # 后台自动续写「总开关」。关闭时即使某本书开启了 autopilot 也不会自动推进。
 allow_autopilot = true
 
@@ -18,12 +18,14 @@ writer_model = "replyer"
 temperature = 0.8
 # 单次写作的最大 token 数（<=0 表示交由宿主模型配置决定，固定模型路径下回退为 8000）
 max_tokens = 0
+# 单次写作/修订调用的超时时间（秒）。写一章往往要几分钟，30 秒会超时；<=0 表示交由宿主默认值。
+timeout_seconds = 600
 # 追加到「人格 + 表达风格」之后的额外写作风格说明（可留空）
 style_supplement = ""
 
 [context]
-# 组装写作上下文的字符预算上限，超出会优先裁剪较旧的摘要与衔接片段
-char_budget = 131072
+# 组装写作上下文的字符预算上限（含 bible/ 下全部设定与本章参考稿），超出会优先裁剪较旧的摘要与衔接片段
+char_budget = 262144
 # 是否在上下文中包含此前章节的滚动摘要
 include_rolling_summary = true
 # 用于生成章节摘要的任务名（建议用速度快的小模型任务）

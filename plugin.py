@@ -33,7 +33,7 @@ import tomli_w
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-CURRENT_CONFIG_VERSION = "0.1.0"
+CURRENT_CONFIG_VERSION = "0.2.0"
 
 GLOBAL_WORKSPACE = "__global__"
 STATUS_SETUP = "setup"
@@ -229,6 +229,7 @@ class WriterSection(PluginConfigBase):
     writer_model: str = Field(default="replyer", description="专职写手模型：任务名或 model_config 中的具体模型名")
     temperature: float = Field(default=0.8, description="写作温度")
     max_tokens: int = Field(default=8000, description="单次写作最大 token 数，<=0 表示交由宿主配置")
+    timeout_seconds: int = Field(default=600, description="单次写作/修订调用的超时时间（秒），<=0 表示交由宿主默认值")
     style_supplement: str = Field(default="", description="追加到人格/表达风格之后的写作风格说明")
 
 
@@ -237,7 +238,7 @@ class ContextSection(PluginConfigBase):
 
     __ui_label__ = "上下文"
 
-    char_budget: int = Field(default=24000, description="写作上下文字符预算上限")
+    char_budget: int = Field(default=262144, description="写作上下文字符预算上限（含全部 bible 设定与参考稿）")
     include_rolling_summary: bool = Field(default=True, description="是否包含历史章节滚动摘要")
     summary_task: str = Field(default="utils", description="生成章节摘要使用的任务名")
 
@@ -544,16 +545,31 @@ class MaiBookPlugin(MaiBotPlugin):
         return "\n\n".join(lines)
 
     def _assemble_context(self, book_dir: Path, meta: Mapping[str, Any], task_text: str) -> str:
-        """在字符预算内组装写作上下文（要点→大纲→人物→设定→决定→摘要→前文衔接）。"""
+        """在字符预算内组装写作上下文（要点→大纲→人物→设定→全部自定义设定→决定→摘要→前文衔接）。
+
+        这是麦麦本人的书：bible/ 下的全部设定文件（含麦麦通过 maibook_add_bible_note
+        自行写入的任意自定义主题）都会作为参考资料带给写手，而不只是几个固定文件。
+        """
         budget = max(2000, int(self.config.context.char_budget))
-        sections: list[tuple[str, str]] = [
-            ("【本书要点】", _meta_brief(meta)),
-            ("【分章大纲】", _read_text(book_dir / "bible" / "plot-outline.md")),
-            ("【人物】", _read_text(book_dir / "bible" / "characters.md")),
-            ("【设定】", _read_text(book_dir / "bible" / "world.md")),
-            ("【数值/其它设定】", _read_text(book_dir / "bible" / "stats.md")),
-            ("【已确认的决定（视为正典）】", _read_text(book_dir / "journal" / "decisions.md")),
+        bible_dir = book_dir / "bible"
+        # 固定槽位：保证大纲/人物/世界等核心设定的顺序与标签稳定
+        named_slots: list[tuple[str, str]] = [
+            ("plot-outline", "【分章大纲】"),
+            ("characters", "【人物】"),
+            ("world", "【设定】"),
+            ("stats", "【数值/其它设定】"),
         ]
+        known_stems = {stem for stem, _ in named_slots}
+        sections: list[tuple[str, str]] = [("【本书要点】", _meta_brief(meta))]
+        for stem, label in named_slots:
+            sections.append((label, _read_text(bible_dir / f"{stem}.md")))
+        # 其余所有自定义 bible 文件（按文件名排序）一并作为参考资料带上
+        if bible_dir.exists():
+            for child in sorted(bible_dir.glob("*.md")):
+                if child.stem in known_stems:
+                    continue
+                sections.append((f"【设定·{child.stem}】", _read_text(child)))
+        sections.append(("【已确认的决定（视为正典）】", _read_text(book_dir / "journal" / "decisions.md")))
         if self.config.context.include_rolling_summary:
             summaries = self._collect_summaries(book_dir)
             if summaries:
@@ -564,9 +580,14 @@ class MaiBookPlugin(MaiBotPlugin):
 
         remaining = budget - len(task_text) - 64
         included: list[str] = []
+        truncated: tuple[str, int, int] | None = None  # (标签, 完整长度, 实际保留)
+        dropped: list[str] = []  # 因预算耗尽被整段省略的非空参考资料
         for label, body in sections:
             body = (body or "").strip()
-            if not body or remaining <= 0:
+            if not body:
+                continue
+            if remaining <= 0:
+                dropped.append(label)
                 continue
             block = f"{label}\n{body}"
             if len(block) <= remaining:
@@ -574,7 +595,22 @@ class MaiBookPlugin(MaiBotPlugin):
                 remaining -= len(block) + 2
             else:
                 included.append(block[:remaining] + "……（略）")
+                truncated = (label, len(block), remaining)
                 remaining = 0
+        if truncated or dropped:
+            # 不静默兜底：上下文超预算被裁剪时必须告警，便于排查“设定没带全”
+            title = str(meta.get("title") or book_dir.name)
+            detail: list[str] = []
+            if truncated:
+                t_label, full_len, kept = truncated
+                detail.append(f"{t_label} 被截断（保留 {kept}/{full_len} 字）")
+            if dropped:
+                detail.append("整段省略：" + "、".join(dropped))
+            self.ctx.logger.warning(
+                "麦书：《%s》写作上下文超出字符预算（budget=%d，任务文本 %d 字），已裁剪部分参考资料——%s。"
+                "如需带上全部 bible 设定/参考稿，请调大 context.char_budget。",
+                title, budget, len(task_text), "；".join(detail),
+            )
         return "\n\n".join(included + [task_text])
 
     def _collect_summaries(self, book_dir: Path) -> str:
@@ -601,11 +637,12 @@ class MaiBookPlugin(MaiBotPlugin):
         model = (writer.writer_model or "").strip() or "replyer"
         temperature = writer.temperature
         max_tokens = writer.max_tokens if writer.max_tokens and writer.max_tokens > 0 else None
+        timeout_ms = int(writer.timeout_seconds * 1000) if writer.timeout_seconds and writer.timeout_seconds > 0 else None
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
         try:
             result = await self.ctx.llm.generate(
-                prompt=messages, model=model, temperature=temperature, max_tokens=max_tokens
+                prompt=messages, model=model, temperature=temperature, max_tokens=max_tokens, timeout_ms=timeout_ms
             )
         except Exception as exc:  # noqa: BLE001
             result = {"success": False, "error": f"调用模型异常：{exc}"}
@@ -686,8 +723,12 @@ class MaiBookPlugin(MaiBotPlugin):
             },
             {"role": "user", "content": f"《{title}》第 {chapter_no} 章正文：\n\n{chapter_text}"},
         ]
+        writer = self.config.writer
+        timeout_ms = int(writer.timeout_seconds * 1000) if writer.timeout_seconds and writer.timeout_seconds > 0 else None
         try:
-            result = await self.ctx.llm.generate(prompt=prompt, model=task, temperature=0.3, max_tokens=600)
+            result = await self.ctx.llm.generate(
+                prompt=prompt, model=task, temperature=0.3, max_tokens=600, timeout_ms=timeout_ms
+            )
             if isinstance(result, dict) and result.get("success") and str(result.get("response", "")).strip():
                 return str(result["response"]).strip()
             self.ctx.logger.warning("麦书：章节摘要生成失败，回退为截断：%s", (result or {}).get("error"))
@@ -699,7 +740,7 @@ class MaiBookPlugin(MaiBotPlugin):
     # 写作核心（工具与后台共用）
     # ------------------------------------------------------------------ #
     async def _do_write_chapter(
-        self, book_dir: Path, meta: Mapping[str, Any], *, chapter_no: Any, brief: str, target_words: int
+        self, book_dir: Path, meta: Mapping[str, Any], *, chapter_no: Any, brief: str, target_words: int, draft: str = ""
     ) -> dict[str, Any]:
         """实际写一章；返回结构化结果（success / need_info / setup-not-ready）。"""
         if meta.get("status") != STATUS_READY:
@@ -731,6 +772,12 @@ class MaiBookPlugin(MaiBotPlugin):
             task_lines.append(f"本章特别要求：{brief.strip()}")
         if target_words and target_words > 0:
             task_lines.append(f"目标字数约 {target_words} 字。")
+        if draft.strip():
+            task_lines.append(
+                "【麦麦提供的本章参考稿】\n"
+                "以下是麦麦本人为本章写好的参考稿，请把它当作本章的基准：保留其情节走向、关键设定与已写明的内容，"
+                "在此基础上完成、润色、扩写为最终正文，不要另起炉灶或与之冲突。\n\n" + draft.strip()
+            )
         task_lines.append("请直接开始写本章正文（可用「## 小节标题」分节）。")
         user = self._assemble_context(book_dir, meta, "\n".join(task_lines))
 
@@ -1143,12 +1190,13 @@ class MaiBookPlugin(MaiBotPlugin):
             ToolParameterInfo(name="book", param_type=ToolParamType.STRING, required=True, description="书的 slug"),
             ToolParameterInfo(name="chapter", param_type=ToolParamType.STRING, required=False, default="next", description="章节号；留空或 next 表示续写下一章"),
             ToolParameterInfo(name="brief", param_type=ToolParamType.STRING, required=False, default="", description="本章的特别要求/要点（可选）"),
+            ToolParameterInfo(name="content", param_type=ToolParamType.STRING, required=False, default="", description="麦麦为本章提供的参考稿/草稿正文（可选）；写手会以它为基准来完成本章，保留其情节与关键设定"),
             ToolParameterInfo(name="target_words", param_type=ToolParamType.INTEGER, required=False, default=0, description="目标字数（可选，0 表示不限）"),
             ToolParameterInfo(name="scope", param_type=ToolParamType.STRING, required=False, default="chat", enum_values=["chat", "global"], description="范围"),
         ],
     )
     async def maibook_write_chapter(
-        self, book: str = "", chapter: str = "next", brief: str = "", target_words: int = 0, scope: str = "chat", **kwargs: Any
+        self, book: str = "", chapter: str = "next", brief: str = "", content: str = "", target_words: int = 0, scope: str = "chat", **kwargs: Any
     ) -> dict[str, Any]:
         scope = self._norm_scope(scope)
         book_dir, meta, error = self._resolve_book(kwargs, book, scope)
@@ -1156,7 +1204,9 @@ class MaiBookPlugin(MaiBotPlugin):
             return error
         async with self._lock(book_dir):
             meta = self._read_meta(book_dir)
-            result = await self._do_write_chapter(book_dir, meta, chapter_no=chapter, brief=brief, target_words=int(target_words or 0))
+            result = await self._do_write_chapter(
+                book_dir, meta, chapter_no=chapter, brief=brief, draft=content, target_words=int(target_words or 0)
+            )
         if result.get("status") == "need_info":
             result["content"] = (
                 f"《{meta.get('title', book)}》第 {result.get('chapter_no')} 章先别急着写——写手需要你先拍板几件事"

@@ -35,7 +35,7 @@
 | `maibook_add_bible_note` | 写/追加隐藏设定（人物/世界/数值…） |
 | `maibook_read` | 读概览/元信息/大纲/设定/某章/正文清单/摘要/问题/决定 |
 | `maibook_check_ready` | 检查要素是否齐全，齐全则置 `ready` |
-| `maibook_write_chapter` | 为已就绪的书写一章（缺信息回报问题，不硬写） |
+| `maibook_write_chapter` | 为已就绪的书写一章（缺信息回报问题，不硬写）；可传 `content` 作为本章参考稿/草稿，写手会在其基础上完成 |
 | `maibook_revise` | 修订某章（整章或仅某 `## 小节`），改前自动快照 |
 | `maibook_record_answer` | 把拍板的决定写入正典并清空待答问题 |
 | `maibook_open_questions` | 查看待拍板的问题 |
@@ -53,8 +53,8 @@
 ## 配置项（`config.toml`）
 
 - `[plugin]`：`enabled`、`config_version`、`allow_autopilot`（后台自动续写**总开关**）
-- `[writer]`：`writer_model`（见下）、`temperature`、`max_tokens`、`style_supplement`（追加写作风格）
-- `[context]`：`char_budget`、`include_rolling_summary`、`summary_task`（摘要用的任务名，默认 `utils`）
+- `[writer]`：`writer_model`（见下）、`temperature`、`max_tokens`、`timeout_seconds`（单次写作/修订调用超时，默认 600s；写一章常需数分钟，<=0 用宿主默认）、`style_supplement`（追加写作风格）
+- `[context]`：`char_budget`（写作上下文字符预算，默认 262144；`bible/` 下**全部**设定文件——含通过 `maibook_add_bible_note` 写入的任意自定义主题——都会作为参考资料带给写手）、`include_rolling_summary`、`summary_task`（摘要用的任务名，默认 `utils`）
 - `[background]`：`interval_seconds`、`max_books_per_tick`
 - `[storage]`：`data_dir`（留空＝插件目录下 `data/`）
 
