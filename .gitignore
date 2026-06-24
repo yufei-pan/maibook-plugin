@@ -1,5 +1,7 @@
 # 运行时数据（每个聊天流的书稿）
 /data/
+# WebUI 保存配置时产生的本地备份
+config_back/
 # Python
 __pycache__/
 *.py[cod]
