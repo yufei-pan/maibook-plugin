@@ -12,7 +12,7 @@
   "urls": {
     "repository": "https://github.com/yufei-pan/maibook-plugin",
     "homepage": "https://github.com/yufei-pan/maibook-plugin",
-    "documentation": "https://github.com/yufei-pan/maibook-plugin/blob/master/README.md",
+    "documentation": "https://github.com/yufei-pan/maibook-plugin/blob/main/README.md",
     "issues": "https://github.com/yufei-pan/maibook-plugin/issues"
   },
   "host_application": {
