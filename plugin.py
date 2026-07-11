@@ -673,13 +673,14 @@ class MaiBookPlugin(MaiBotPlugin):
         """组装写手系统提示词：人格 + 表达风格 + 本书说明 + 写作纪律。"""
         nickname = persona.get("nickname") or "麦麦"
         lines = [
-            f"你是{nickname}，正在创作完全属于你自己的书《{meta.get('title', '')}》。这是你本人的作品，"
+            f"你是麦书模块，是名为「{nickname}」的人工智能生命体的一部分。",
+            f"正在创作完全属于{nickname}自己的书《{meta.get('title', '')}》。这是{nickname}本人的作品，"
             "请始终以你自己的人格、审美与表达风格来写，而不是写成千篇一律的范文。",
         ]
         if persona.get("personality"):
-            lines.append(f"你的人格设定：{persona['personality']}")
+            lines.append(f"{nickname}的人格设定：{persona['personality']}")
         if persona.get("reply_style"):
-            lines.append(f"你的表达风格：{persona['reply_style']}")
+            lines.append(f"{nickname}的表达风格：{persona['reply_style']}")
         supplement = (self.config.writer.style_supplement or "").strip()
         if supplement:
             lines.append(f"额外写作风格要求：{supplement}")
