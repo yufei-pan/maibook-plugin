@@ -43,28 +43,34 @@ class MockLLM:
         self.last_writer_kwargs: dict = {}  # 记录写手调用收到的额外参数（用于校验 timeout_ms 透传）
         self.gate: asyncio.Event | None = None  # 若设置，写手调用会在此阻塞，便于测试并发/非阻塞
 
-    async def generate(self, prompt, model="", temperature=None, max_tokens=None, **kwargs):
-        self.models.append(model)
+    async def generate(
+        self, prompt, model="", temperature=None, max_tokens=None, task_name=None, model_name=None, **kwargs
+    ):
+        routed = task_name or model_name or model
+        self.models.append(routed)
         text = prompt if isinstance(prompt, str) else " ".join(str(item.get("content", "")) for item in prompt)
         if "编辑助手" in text:  # 摘要任务
-            return {"success": True, "response": "（摘要）林夏带着会说话的罗盘启程，立下寻找沉城的目标。", "model": model}
+            return {"success": True, "response": "（摘要）林夏带着会说话的罗盘启程，立下寻找沉城的目标。", "model": routed}
         self.writer_prompts.append(text)
         self.last_writer_kwargs = dict(kwargs)
         if self.gate is not None:  # 模拟写手耗时，验证工具是否非阻塞
             await self.gate.wait()
         if self.mode == "unknown_task":
-            return {"success": False, "error": f"未找到名为 `{model}` 的模型配置"}
+            return {"success": False, "error": f"未找到名为 `{routed}` 的模型配置"}
         if self.mode == "need_info":
             return {
                 "success": True,
                 "response": "===NEED_INFO===\n- 主角的真实身份要不要在第二章揭示？\n- 结局走向是开放式还是闭合式？",
-                "model": model,
+                "model": routed,
             }
         return {
             "success": True,
             "response": "## 启程\n潮声漫过礁石，海雾未散。\n\n林夏握紧那枚旧罗盘，一步步朝灯塔走去。",
-            "model": model,
+            "model": routed,
         }
+
+    async def get_available_models(self):
+        return ["utils", "planner", "replyer"]
 
 
 def build_ctx(llm: MockLLM, counters: dict[str, int]) -> SimpleNamespace:
@@ -109,6 +115,15 @@ def check(condition: bool, message: str, payload=None) -> None:
         raise AssertionError(f"{message} | payload={payload!r}")
 
 
+def test_resolve_llm_route() -> None:
+    route = plugin_module.resolve_llm_route
+    check(route("replyer", ["utils", "planner", "replyer"]) == ("replyer", None), "任务名应走 task_name")
+    check(route("deepseek-v4-flash", ["utils", "planner", "replyer"]) == (None, "deepseek-v4-flash"), "具体模型应走 model_name")
+    check(route("utils", None) == ("utils", None), "列表不可用时应按任务名")
+    check(route("utils", []) == ("utils", None), "空列表应按任务名")
+    print("ok: resolve_llm_route")
+
+
 async def finish(p, started):
     """等待异步写作/修订任务完成，返回其登记记录；同步返回（门禁/校验错误）则原样返回。"""
     tid = started.get("task_id")
@@ -130,6 +145,7 @@ async def pump(predicate, limit: int = 200):
 
 
 async def main() -> None:
+    test_resolve_llm_route()
     llm = MockLLM()
     counters = {"text": 0, "image": 0, "render": 0, "append": 0, "trigger": 0}
     tmp = Path(tempfile.mkdtemp(prefix="maibook-test-"))

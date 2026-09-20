@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.3] - 2026-09-20
+
+### 修复
+
+- 写手与章节摘要的 LLM 调用改为按 Host 任务名走 `task_name`，具体模型走 `model_name`。SDK 2.8.1 会默认附带 `task_name="utils"`，若再把 `replyer`/`utils` 放进 `model`，Host 会当成具体模型名并报「未找到名为 … 的模型」
+
 ## [0.1.2] - 2026-08-01
 
 ### 变更
