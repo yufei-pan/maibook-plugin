@@ -204,11 +204,6 @@ def _toml_safe(meta: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in meta.items() if value is not None}
 
 
-def _flatten_messages(messages: list[dict[str, Any]]) -> str:
-    """把 system/user 消息列表压平为单段提示词（用于固定模型路径）。"""
-    return "\n\n".join(str(item.get("content", "")).strip() for item in messages if str(item.get("content", "")).strip())
-
-
 def _clip(text: str, limit: int = MAX_RETURN_CHARS) -> str:
     """裁剪过长文本用于工具返回展示。"""
     if len(text) <= limit:
@@ -909,7 +904,7 @@ class MaiBookPlugin(MaiBotPlugin):
         return text[:head_chars] if text else ""
 
     async def _writer_generate(self, system: str, user: str) -> dict[str, Any]:
-        """调用写手模型：优先按任务名走 ctx.llm.generate，名称无法解析时回退固定模型。"""
+        """调用写手模型：任务名走 ``task_name``，具体模型名走 ``model_name``（Host 直选该模型，不会换用其他模型）。"""
         writer = self.config.writer
         model = (writer.writer_model or "").strip() or "replyer"
         temperature = writer.temperature
@@ -931,66 +926,7 @@ class MaiBookPlugin(MaiBotPlugin):
             return result
 
         error_text = str((result or {}).get("error") or "")
-        # 任务名未命中（典型错误含「未找到」）→ writer_model 可能是具体模型名，尝试固定该模型
-        looks_like_unknown_task = (not result) or ("未找到" in error_text) or ("task" in error_text.lower())
-        if looks_like_unknown_task:
-            pinned = await self._writer_generate_pinned(_flatten_messages(messages), temperature, max_tokens)
-            if pinned.get("success"):
-                return pinned
-            return {"success": False, "error": pinned.get("error") or error_text or "生成失败", "response": ""}
         return {"success": False, "error": error_text or "生成失败", "response": ""}
-
-    async def _writer_generate_pinned(
-        self, prompt_text: str, temperature: float | None, max_tokens: int | None
-    ) -> dict[str, Any]:
-        """固定到具体模型生成（参照 smart_segmentation / nai_pic 的做法，依赖宿主内部模块）。"""
-        model_name = (self.config.writer.writer_model or "").strip()
-        if not model_name:
-            return {"success": False, "error": "未配置写手模型"}
-        try:
-            from src.config.model_configs import TaskConfig  # 宿主内部模块，跨版本可能变动
-            from src.llm_models.utils_model import LLMOrchestrator
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "success": False,
-                "error": f"当前宿主不支持固定具体模型（请将 writer_model 设为任务名，或把该模型加入某任务的 model_list）：{exc}",
-            }
-
-        class _PinnedOrchestrator(LLMOrchestrator):  # type: ignore[misc, valid-type]
-            """覆盖任务配置解析，强制使用固定的单模型任务配置。"""
-
-            def __init__(self, task_config: Any, request_type: str = "") -> None:
-                self._pinned = task_config
-                super().__init__(task_name="replyer", request_type=request_type)
-
-            def _get_task_config_or_raise(self) -> Any:
-                return self._pinned
-
-            def _refresh_task_config(self) -> Any:
-                return self._pinned
-
-        try:
-            task_config = TaskConfig(
-                model_list=[model_name],
-                temperature=float(temperature) if temperature is not None else 0.8,
-                max_tokens=int(max_tokens) if max_tokens else 8000,
-                selection_strategy="random",
-                slow_threshold=30.0,
-            )
-            orchestrator = _PinnedOrchestrator(task_config, request_type="plugin.maibook")
-            result = await orchestrator.generate_response_async(
-                prompt=prompt_text,
-                temperature=float(temperature) if temperature is not None else None,
-                max_tokens=int(max_tokens) if max_tokens else None,
-            )
-            return {
-                "success": True,
-                "response": str(getattr(result, "response", "") or ""),
-                "reasoning": str(getattr(result, "reasoning", "") or ""),
-                "model": str(getattr(result, "model_name", model_name) or model_name),
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {"success": False, "error": f"固定模型 `{model_name}` 生成失败：{exc}"}
 
     async def _summarize_chapter(self, title: str, chapter_no: int, chapter_text: str) -> tuple[str, dict[str, Any] | None]:
         """为单章生成滚动摘要（用速度快的小模型任务）。失败时回退为开头截断并记日志。"""

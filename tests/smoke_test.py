@@ -454,11 +454,13 @@ async def main() -> None:
     r = await p.bookshelf_list(scope="chat", **kw)
     check(r["success"] and r.get("count", 0) >= 1, "list_books 应列出书", r)
 
-    # 13) 写手模型解析：未知任务名 → 尝试固定模型（测试环境无宿主内部模块）→ 友好报错
+    # 13) 写手模型解析：具体模型名只走公开 model_name 直选；宿主报错原样返回，不再回退宿主内部固定模型路径
     p.config.writer.writer_model = "deepseek-v4-flash"
     llm.mode = "unknown_task"
+    calls_before = len(llm.models)
     gen = await p._writer_generate("系统提示", "用户提示")
-    check(not gen["success"] and ("固定" in gen.get("error", "") or "宿主" in gen.get("error", "")), "未知模型名应回退并友好报错", gen)
+    check(not gen["success"] and "未找到" in gen.get("error", ""), "未知模型名应原样返回宿主报错", gen)
+    check(llm.models[calls_before:] == ["deepseek-v4-flash"], "具体模型名应只按 model_name 调用一次", llm.models[calls_before:])
     p.config.writer.writer_model = "replyer"
     llm.mode = "normal"
 

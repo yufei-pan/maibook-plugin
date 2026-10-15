@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.1.4] - 2026-10-14
+
+### 修复
+
+- 移除写手的「固定模型」回退路径：它借用宿主内部 `TaskConfig`/`LLMOrchestrator`，在宿主 1.3.0+ 上因 `TaskConfig` 删除 `slow_threshold` 必然失败，且会用「当前宿主不支持固定具体模型…」覆盖宿主的真实报错。具体模型名本就经公开 `ctx.llm.generate(model_name=…)` 直选，宿主报错现原样返回
+
+### 变更
+
+- 宿主最低版本升至 **1.2.5**（公开 LLM 能力区分 `task_name` 与 `model_name` 的首个版本，0.1.3 起即依赖）；SDK 仍为 **≥2.8.1**
+
 ## [0.1.3] - 2026-09-20
 
 ### 修复

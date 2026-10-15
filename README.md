@@ -92,10 +92,8 @@
 `writer_model` 既可填**任务名**，也可填 `model_config.toml` 里定义的**具体模型名**：
 
 - 填**任务名**（如 `replyer`/`planner`/`utils`）：走 `ctx.llm.generate(task_name=…)`。默认 `replyer`＝复用麦麦自己的回复模型，**语气最贴合**。
-- 填**具体模型名**（如 `deepseek-v4-flash`）：走 `ctx.llm.generate(model_name=…)`。若宿主仍报「未找到」，会**回退为「固定模型」路径**——
-  借用宿主的 `LLMOrchestrator` 以一次性 `TaskConfig(model_list=[该模型])` 运行（参照 `smart_segmentation` / `nai_pic` 的做法）。
-  该路径依赖宿主内部模块（`src.llm_models.utils_model` 等），**跨宿主版本可能变动**；若不可用，会给出清晰报错，
-  此时请改用任务名，或把该模型加入某个任务的 `model_list`。
+- 填**具体模型名**（如 `deepseek-v4-flash`）：走 `ctx.llm.generate(model_name=…)`，宿主直选该模型（需宿主 ≥ 1.2.5），该模型失败时直接报错、不会换用其他模型。
+  宿主报「未找到名为 … 的模型」时原样返回，请检查名称是否与 `model_config.toml` 中的 `name` 一致，或改用任务名。
 
 > 人格与表达风格在运行时通过 `ctx.config.get("personality.personality" / "personality.reply_style" / "bot.nickname")` 读取并注入写手提示词，无需手动配置。
 
