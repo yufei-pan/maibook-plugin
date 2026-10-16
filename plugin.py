@@ -2050,7 +2050,8 @@ class MaiBookPlugin(MaiBotPlugin):
                 credits = _read_text(self._credits_path(book_dir)).strip()
                 if credits:
                     compiled = compiled + "\n\n---\n\n" + credits
-            out_path = book_dir / "compiled" / f"{_safe_component(title) or book}-v{version}.md"
+            # version 可经 bookshelf_meta 写入任意字符串，必须与 title 一样清洗，否则 ../ 会跳出 compiled/
+            out_path = book_dir / "compiled" / f"{_safe_component(title) or book}-v{_safe_component(version) or '0.1.0'}.md"
             _atomic_write(out_path, compiled + "\n")
             return {"success": True, "path": str(out_path), "content": f"已编译《{title}》到本地文件：\n{out_path}"}
 

@@ -16,7 +16,7 @@ allow_autopilot = true
 writer_model = "replyer"
 # 写作温度（越高越发散）
 temperature = 0.8
-# 单次写作的最大 token 数（<=0 表示交由宿主模型配置决定，固定模型路径下回退为 8000）
+# 单次写作的最大 token 数（<=0 表示交由宿主模型配置决定）
 max_tokens = 0
 # 单次写作/修订调用的超时时间（秒）。写一章往往要几分钟，30 秒会超时；<=0 表示交由宿主默认值。
 timeout_seconds = 600

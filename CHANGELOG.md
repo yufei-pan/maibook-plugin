@@ -5,6 +5,17 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- `publish_deliver`（`format=disk`）落盘文件名中的 `version` 现与书名一样经 `_safe_component` 清洗。`version` 可经 `bookshelf_meta` 写入任意字符串，含 `../` 时编译产物会写到 `compiled/` 之外
+- 文档：`config.default.toml` 去掉已删除的「固定模型路径」说明；README 就绪门禁的工具名更正为 `review_ready`
+
+### 变更
+
+- manifest 兼容上限改为实际验证过的范围：宿主 `max_version` 1.99.99 → **1.3.99**，SDK `max_version` 2.99.99 → **2.14.99**（SDK 2.14.0 上测试通过）。插件仓库审核不再接受「永远兼容」式的上限
+
 ## [0.1.4] - 2026-10-14
 
 ### 修复

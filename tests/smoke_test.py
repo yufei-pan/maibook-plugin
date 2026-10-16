@@ -413,6 +413,14 @@ async def main() -> None:
     check(r["success"] and Path(r["path"]).exists(), "disk 交付应产出文件", r)
     compiled_text = Path(r["path"]).read_text(encoding="utf-8")
     check("致谢" in compiled_text and "创作模型（Models）" in compiled_text, "整本 disk 交付应附带 credits 致谢", compiled_text[-600:])
+    # 10a) 回归：meta.version 可经 bookshelf_meta 写入任意字符串，disk 交付路径必须清洗，不能跳出 compiled/
+    disk_dir = Path(r["path"]).resolve().parent
+    m = await p.bookshelf_meta(book=slug, updates={"version": "../../../../escape"}, **kw)
+    check(m["success"], "写入可疑 version 应成功（仅在落盘路径处清洗）", m)
+    r = await p.publish_deliver(book=slug, format="disk", **kw)
+    check(r["success"] and Path(r["path"]).resolve().parent == disk_dir, "disk 交付不得因 version 含 ../ 跳出 compiled/", r)
+    m = await p.bookshelf_meta(book=slug, updates={"version": "0.1.0"}, **kw)
+    check(m["success"], "恢复 version 应成功", m)
     r = await p.publish_deliver(book=slug, format="text", **kw)
     check(r["success"] and counters["text"] > 0, "text 交付应直接发送", (r, counters))
     r = await p.publish_deliver(book=slug, format="png", **kw)
