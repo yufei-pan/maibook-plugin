@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- 写作/修订完成时发到聊天的正文改为带 `sync_to_maisaka_history=True` 发送，进入麦麦的聊天历史，规划器和回复器都能看到；全部同步成功时，注入给麦麦的提示不再重复附正文副本（发送失败时仍附）。宿主 1.3.12 起 `ctx.maisaka.context.append` 注入的内容只进规划器、回复器看不到。`publish_deliver` / `review_read(send=...)` 的显式交付不同步，免得整本正文挤掉上下文窗口
+
+### 变更
+
+- SDK 兼容上限 `max_version` 2.14.99 → **2.16.99**：宿主 1.3.14 + SDK 2.16.0 上测试通过（SDK 2.15 / 2.16 只新增能力，无破坏性变更）
+
 ## [0.1.5] - 2026-10-16
 
 ### 修复

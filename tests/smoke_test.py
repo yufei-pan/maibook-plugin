@@ -74,11 +74,15 @@ class MockLLM:
 
 
 def build_ctx(llm: MockLLM, counters: dict[str, int]) -> SimpleNamespace:
+    text_kwargs: list[dict] = []  # 每次 send.text 的额外参数（检查是否同步进麦麦历史）
+    appended: list[str] = []  # 每次 context.append 注入的文本
+
     async def cfg_get(path, default=None):
         return PERSONA.get(path, default)
 
     async def send_text(text, stream_id, **kwargs):
         counters["text"] += 1
+        text_kwargs.append(kwargs)
         return True
 
     async def send_image(image_data, stream_id, **kwargs):
@@ -91,6 +95,7 @@ def build_ctx(llm: MockLLM, counters: dict[str, int]) -> SimpleNamespace:
 
     async def ctx_append(**kwargs):
         counters["append"] += 1
+        appended.append("".join(seg.get("content", "") for seg in kwargs.get("segments", [])))
         return {"success": True}
 
     async def trigger(**kwargs):
@@ -107,6 +112,7 @@ def build_ctx(llm: MockLLM, counters: dict[str, int]) -> SimpleNamespace:
             context=SimpleNamespace(append=ctx_append),
             proactive=SimpleNamespace(trigger=trigger),
         ),
+        records=SimpleNamespace(text_kwargs=text_kwargs, appended=appended),
     )
 
 
@@ -254,6 +260,19 @@ async def main() -> None:
         "写作完成应注入上下文、唤醒麦麦并把正文 text 发到聊天",
         (ap0, tr0, tx0, counters),
     )
+    # 6a') 宿主 1.3.12 起回复器只看真实聊天消息：完成时的正文须同步进麦麦历史，注入的提示不再重复附正文副本
+    records = p.ctx.records
+    done_sends = records.text_kwargs[tx0:]
+    check(
+        bool(done_sends) and all(k.get("sync_to_maisaka_history") is True and k.get("maisaka_source_kind") == "plugin:maibook" for k in done_sends),
+        "写作完成发到聊天的正文应同步进麦麦历史",
+        done_sends,
+    )
+    check(
+        "上下文副本" not in records.appended[-1] and "同步进你的聊天记录" in records.appended[-1],
+        "正文已全部同步时，注入的提示不应再附正文副本",
+        records.appended[-1],
+    )
     # 6b) 任务状态工具仍保留（可选，供麦麦主动查看）
     st = await p.write_status(task_id=started["task_id"], **kw)
     check(st["success"] and "已完成" in st["content"], "task_status 应能查到已完成任务", st)
@@ -278,6 +297,11 @@ async def main() -> None:
     check(rd_send["success"] and counters["text"] > t_before, "review_read send=text 应把该章发到聊天", (rd_send, counters))
     check(rd_send.get("sent_to_chat", 0) > 0 and "发送到聊天" in rd_send["content"], "send=text 返回应注明已发聊天", rd_send)
     check("启程" in rd_send["content"], "send=text 后正文仍应留在返回里（供你的上下文）", rd_send)
+    check(
+        all(not k for k in p.ctx.records.text_kwargs[t_before:]),
+        "显式交付（review_read send=text）不应同步进麦麦历史，免得长正文挤掉上下文窗口",
+        p.ctx.records.text_kwargs[t_before:],
+    )
 
     # 6f) 回归：写/改第 0 章时不应带上全书最后一章的「上一章结尾」
     ch1_marker = "ONLY_CHAPTER_ONE_ENDING_TAIL_MARKER"
@@ -440,6 +464,16 @@ async def main() -> None:
     p.ctx.send.text = _failing_send
     r = await p.publish_deliver(book=slug, format="text", **kw)
     check(not r["success"], "全部发送失败时 text 交付应回报 success=False", r)
+    # 10b') 完成时正文发送失败（没进历史）：注入的提示须回退为附带正文副本
+    await p._surface_task_completion(
+        {"stream_id": kw["stream_id"], "title": "回退测试", "kind": "write", "chapter_no": 1, "status": "done"},
+        str(book_dir),
+    )
+    check(
+        "上下文副本" in p.ctx.records.appended[-1] and "启程" in p.ctx.records.appended[-1],
+        "正文发送失败时，注入的提示应附正文副本",
+        p.ctx.records.appended[-1],
+    )
     p.ctx.send.text = original_send_text
 
     # 10d) 长图发送走「1x 渲染 + 无损 WebP 重编码」以适配 NapCat 默认动作超时：

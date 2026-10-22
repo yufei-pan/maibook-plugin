@@ -1172,8 +1172,13 @@ class MaiBookPlugin(MaiBotPlugin):
             wc = record.get("word_count")
             sent_count, total_chunks = 0, 0
             if body:
-                sent_count, total_chunks = await self._send_units_to_chat([(chap or "正文", body)], "text", stream_id)
-            if sent_count > 0:
+                sent_count, total_chunks = await self._send_units_to_chat(
+                    [(chap or "正文", body)], "text", stream_id, sync_to_history=True
+                )
+            fully_synced = sent_count > 0 and sent_count == total_chunks
+            if fully_synced:
+                chat_note = f"正文已以 text 分段发送到本聊天流并同步进你的聊天记录（{sent_count} 段），编辑（editor）可直接阅读。"
+            elif sent_count > 0:
                 chat_note = f"正文已以 text 分段发送到本聊天流（{sent_count}/{total_chunks} 段），编辑（editor）可直接阅读；"
             elif body:
                 chat_note = "正文发送到聊天流失败（详见日志）；"
@@ -1186,8 +1191,12 @@ class MaiBookPlugin(MaiBotPlugin):
             header = f"【麦书】你刚{verb}好《{title}》{chap}" + (f"（约 {wc} 字）" if wc else "") + "。"
             if chat_note:
                 header += chat_note
-            header += "以下为你自己的上下文副本："
-            content = header + "\n\n" + _clip(body) if body else (header + "\n\n" + str(record.get("detail", "")))
+            if fully_synced:
+                # 正文已作为真实聊天消息进入历史，规划器和回复器都看得到，不再重复附副本
+                content = header
+            else:
+                header += "以下为你自己的上下文副本："
+                content = header + "\n\n" + _clip(body) if body else (header + "\n\n" + str(record.get("detail", "")))
             await self._surface_to_mai(
                 stream_id, content,
                 intent=f"《{title}》{chap}已{verb}好，请决定是否审阅/继续往下推进",
@@ -2080,14 +2089,21 @@ class MaiBookPlugin(MaiBotPlugin):
 
         return {"success": False, "content": f"未知交付形式：{fmt}"}
 
-    async def _send_units_to_chat(self, units: list[tuple[str, str]], fmt: str, stream_id: str) -> tuple[int, int]:
+    async def _send_units_to_chat(
+        self, units: list[tuple[str, str]], fmt: str, stream_id: str, *, sync_to_history: bool = False
+    ) -> tuple[int, int]:
         """把若干「单元」发到聊天流：text=分段发文本（绕过回复管线）；png=逐单元渲染长图发送。
-        返回 (实际发出数, 总数)。供 publish_deliver 与 review_read(send=...) 共用。"""
+        返回 (实际发出数, 总数)。供 publish_deliver 与 review_read(send=...) 共用。
+        sync_to_history=True 时文本分段同步进麦麦的聊天历史（宿主 1.3.12 起回复器只看真实聊天消息）；
+        整本交付默认不同步，免得大段正文挤掉上下文窗口里的真实对话。"""
         if fmt == "text":
             chunks = self._chunk_units(units)
+            sync_kwargs: dict[str, Any] = (
+                {"sync_to_maisaka_history": True, "maisaka_source_kind": "plugin:maibook"} if sync_to_history else {}
+            )
             sent = 0
             for chunk in chunks:
-                if await self.ctx.send.text(chunk, stream_id):
+                if await self.ctx.send.text(chunk, stream_id, **sync_kwargs):
                     sent += 1
             return sent, len(chunks)
         if fmt == "png":
